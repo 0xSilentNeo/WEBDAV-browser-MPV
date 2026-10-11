@@ -65,13 +65,14 @@ Needs `curl` (built into Windows 10+). Installing **ffmpeg** makes artwork conve
 Every option is explained in `webdav-browser.conf`. The ones most people change: `start_path`, `ui_scale`,
 `home_card_pct`, `merge_seasons`, `poster_overrides`, `rd_api_token`, `next_episode_card`, `couch_mode`.
 
-## Recommended companion scripts
+## Recommended/Used companion scripts
 
-- [uosc](https://github.com/tomasklaen/uosc) – a modern on-screen controller (seek bar, menus, chapter marks).
+- [ModernZ](https://github.com/Samillion/ModernZ) – A sleek and modern OSC for mpv..
 - [thumbfast](https://github.com/po5/thumbfast) – seek-bar thumbnails for uosc and other OSCs.
-- op-ed-pv-skip or another chapter skipper – skips openings / endings; the next-episode card adapts to it.
+- [op-ed-pv-skip](https://github.com/awaken1ng/mpv-op-ed-pv-skip) or another chapter skipper – skips openings / endings; the next-episode card adapts to it.
 - [autosubsync-mpv](https://github.com/joaquintorres/autosubsync-mpv) – fixes out-of-sync subtitles with one key.
 - [Anime4K](https://github.com/bloc97/Anime4K) – GPU shaders that upscale anime sharply on a 4K screen.
+- [hold-speed](https://github.com/0xSilentNeo/Hold-Speed) – A Lua script for mpv that mimics YouTube’s playback speed feature.
 
 ## Credits
 
