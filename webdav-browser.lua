@@ -1,36 +1,10 @@
 --[[
-webdav-browser v10  -  two-panel (Folders | Files) WebDAV browser for mpv
+webdav-browser v13.1  -  two-panel (Folders | Files) WebDAV browser for mpv, for a Real-Debrid (or any) WebDAV library
 
-What's new in v10
-  Fixes
-  - Windows on-screen-keyboard arrows (KP_UP/KP_DOWN/KP_LEFT/KP_RIGHT/KP_ENTER...) work in
-    BOTH browse and search mode: every key alias now comes from ONE table
-  - 'r' on the Folders panel refreshes the whole visible folder tree (root + expanded folders);
-    'R' refreshes everything and re-indexes. Deleted folders are pruned instead of lingering
-  - Watch history / watched markers / directory cache now actually persist (single-file scripts
-    have no script directory: data now lives in <mpv config>/script-opts/)
-  - Late replies from a slow folder can no longer overwrite the folder you opened afterwards
-  - A failed refresh of one folder no longer blanks the healthy Files panel (errors are per folder)
-  - Retry-on-failure also works when a file fails to OPEN; retry counters reset on success
-  - Auto-play "next episode" follows natural filename order, not the on-screen sort
-  - A few seconds of viewing no longer creates an "in progress" marker
-  - '+' in file names is no longer turned into a space
-  - Search box: any character can be typed (any_unicode fallback), words match across . _ - separators
-  - Credentials: curl gets them on stdin (not on the command line) and the stream auth header is
-    scoped to files on your server instead of being sent session-wide
-  - HTTP status codes are checked; timeouts / 429 / 5xx are retried with back-off
-  - Background blur is cheaper ("lite" mode) and is skipped for heavy / hardware-decoded video
-  New
-  - Sakura Night palette
-  - Experimental clean titles with quality chips (experimental_clean_titles)
-  - Persistent recursive search: background index of the whole library ('f')
-  - Mouse: double-click to play, expand arrow hit-area, wheel scrolls the view, draggable scrollbar
-  - "Resumed at 12:34" notice with a start-over key
-  - Per-folder sort memory; live config reload (edit the .conf while the browser is open)
-  - Debug overlay ('d'): cache age, last request time/status, index state
-  - Continue Watching row at the top of the Folders panel, 'm' toggles watched, 'H' hides watched
-
-Ctrl+W toggles. Config: script-opts/webdav-browser.conf
+Ctrl+W opens / closes it. Settings: script-opts/webdav-browser.conf (shared with webdav-browser-posters.lua, the
+poster edition; both can be installed side by side - the one opened
+last owns playback and the data file). Every feature and option is described in README.md and in
+the comments of the conf.
 ]]--
 
 local mp      = require("mp")
@@ -42,7 +16,7 @@ local options = require("mp.options")
 local U = {}   -- utilities: text / url / time / matching helpers
 local D = {}   -- ASS drawing primitives
 
-local SCRIPT_VERSION = "v10.9"
+local SCRIPT_VERSION = "v13.1"
 
 -- ============================================================
 -- OPTIONS  (edit these via script-opts/webdav-browser.conf)
@@ -190,9 +164,22 @@ local o = {
     clean_titles_tooltip = true,       -- Hovering a row shows its full release name in a tooltip
     -- (used by webdav-browser-posters.lua only; listed so the shared conf does not warn)
     home_view = true, home_card_pct = 19, home_recent_count = 20,
-    merge_seasons = true, queue_folder = true, queue_max = 200, cache_clear_key = "ctrl+x",   -- poster edition only (listed so the shared conf does not warn)
+    merge_seasons = true, queue_folder = true, queue_max = 200,   -- poster edition only (listed so the shared conf does not warn)
+    cache_clear_key = "ctrl+x",        -- Press twice to clear the folder-listing cache (watch history is never touched)
+    rd_api_token = "", rd_api_base = "https://api.real-debrid.com/rest/1.0", experimental_merge_by_tmdb = false,
+    poster_overrides = "", show_missing_episodes = true,   -- poster edition only
+    ui_scale = 1.0, continue_landscape = true, experimental_animations = false,   -- poster edition only
     open_key_posters = "ctrl+p", experimental_posters = true, tmdb_key = "", poster_column_pct = 17,
-    poster_converter = "auto", poster_cache_dir = "",
+    poster_converter = "auto", poster_cache_dir = "", ffmpeg_path = "ffmpeg", magick_path = "magick",
+    tmdb_api_base = "", tmdb_image_base = "",
+    -- New in 13 (poster edition only, listed so the shared conf does not warn)
+    anime_lookup = true, anime_map_url = "", anilist_api = "", card_radius = 6, card_shadows = true, selected_grow = 1.06,
+    idle_prefetch_rows = 3, couch_mode = "auto", couch_open_keys = "GAMEPAD_BACK",
+    experimental_backdrop = false,
+    remember_tracks = true,            -- Remember the audio + subtitle language per show (pick once, every episode starts that way)
+    next_episode_card = true,          -- "Next episode in 10..." card near the end credits (Esc = stay, Enter = play now)
+    next_episode_secs = 10,            -- Length of that countdown
+    next_episode_timing = "auto",      -- auto | credits | before (before = ends where the ED begins, for chapter-skip scripts)
     open_key = "ctrl+w",               -- Key(s) that open/close the browser (separate several with spaces), e.g. "ctrl+w ctrl+p"
     clean_folder_titles = true,        -- Also clean the folder names in the left panel (title + season + quality + release group)
 
@@ -851,6 +838,29 @@ local function safe_json(payload)
     return nil
 end
 
+-- Folder listings live in their own file (dirs.json, shared with the poster edition), so saving them never
+-- rewrites the watch history, and the history file stays small.
+function MS.cache_dir()
+    if MS._cdir then return MS._cdir end
+    local d = tostring(o.poster_cache_dir or "")
+    if d == "" then
+        local base = data_dir()
+        d = base and utils.join_path(base, "webdav_posters")
+            or ((os.getenv("TEMP") or os.getenv("TMP") or os.getenv("TMPDIR") or "/tmp"):gsub("\\", "/") .. "/webdav_posters")
+    end
+    MS._cdir = (d:gsub("\\", "/"):gsub("/+$", ""))
+    return MS._cdir
+end
+function MS.mkdir()
+    if MS._made then return end
+    local d = MS.cache_dir()
+    local is_win = package.config:sub(1, 1) == "\\"
+    local args = is_win and { "cmd", "/c", "mkdir", (d:gsub("/", "\\")) } or { "mkdir", "-p", d }
+    pcall(mp.command_native, { name = "subprocess", args = args, capture_stdout = true, capture_stderr = true, playback_only = false })
+    MS._made = true
+end
+local function dircache_path() return MS.cache_dir() .. "/dirs.json" end
+
 local function load_persistence()
     local path = history_file_path()
     persist_status.path = path
@@ -865,25 +875,28 @@ local function load_persistence()
         watched_set   = U.plain(data.watched)
         sort_by_dir   = U.plain(data.sort)
         index_meta    = U.plain(data.index)
-        if o.persist_dir_cache and type(data.dir_cache) == "table" then
-            dir_cache = U.plain(data.dir_cache)
-            MS.cache_version = MS.cache_version + 1
-        end
+        MS.hints      = U.plain(data.hints)
+        MS.tracks     = U.plain(data.tracks)
+        MS.rev        = tonumber(data.rev) or 0
+    end
+    if o.persist_dir_cache then
+        local cp = dircache_path()
+        local c = cp and try_load_json(cp)
+        if type(c) == "table" and type(c.dir_cache) == "table" then dir_cache = U.plain(c.dir_cache)
+        elseif data and type(data.dir_cache) == "table" then dir_cache = U.plain(data.dir_cache) end   -- older versions kept it in the history file
+        MS.cache_version = MS.cache_version + 1
     end
     persist_status.ok = true
 end
 
+-- History file: small, written often, only ever by the instance that owns playback (MS.active).
 save_persistence = function(force)
-    if MS.active == false and not force then return end     -- only the instance that owns playback writes
+    if MS.active == false and not force then return end
     local path = persist_status.path or history_file_path()
     if not path then return end
-    local payload = { v = 2, history = watch_history, watched = watched_set, sort = sort_by_dir, index = index_meta }
-    if o.persist_dir_cache then payload.dir_cache = dir_cache end
-    local json = safe_json(payload)
-    if not json and payload.dir_cache then     -- the big cache must never cost you the history
-        payload.dir_cache = nil
-        json = safe_json(payload)
-    end
+    MS.rev = (MS.rev or 0) + 1
+    local json = safe_json({ v = 3, rev = MS.rev, history = watch_history, watched = watched_set, sort = sort_by_dir,
+        index = index_meta, hints = MS.hints, tracks = MS.tracks })
     if not json then
         persist_status.ok, persist_status.err = false, "format_json failed"
         return
@@ -896,14 +909,33 @@ save_persistence = function(force)
     else msg.warn("webdav-browser: could not save data: " .. tostring(werr)) end
 end
 
+local function save_dircache()
+    if not o.persist_dir_cache or MS.active == false then return end
+    local cp = dircache_path()
+    if not cp then return end
+    local json = safe_json({ v = 1, dir_cache = dir_cache })
+    if not json then return end
+    local ok = atomic_write(cp, json)
+    if not ok then
+        -- the cache folder may not exist yet
+        MS.mkdir()
+        ok = atomic_write(cp, json)
+    end
+    if ok then MS.cache_dirty = false; persist_status.cache_bytes = #json end
+end
+
 -- Directory-cache writes are batched: the first dirty change schedules ONE flush; further changes
 -- inside that window ride along. Watch-history saves (end-file) stay immediate.
 local persist_debounce_timer = nil
-local function debounced_save_persistence(delay)
+-- what = "cache" (a folder listing changed) only rewrites dirs.json; anything else also saves the history file.
+local function debounced_save_persistence(delay, what)
+    if what ~= "cache" then MS.hist_dirty = true end
+    MS.cache_dirty = MS.cache_dirty or (what == "cache")
     if persist_debounce_timer then return end
     persist_debounce_timer = mp.add_timeout(delay or 3, function()
         persist_debounce_timer = nil
-        save_persistence()
+        if MS.hist_dirty then MS.hist_dirty = false; save_persistence() end
+        if MS.cache_dirty then save_dircache() end
     end)
 end
 
@@ -1137,6 +1169,23 @@ local function store_listing(href, entries)
     dir_cache[href] = { entries = entries, ts = os.time() }
     MS.cache_version = MS.cache_version + 1
     mark_continue_dirty()
+    -- Real-Debrid fills a big torrent folder gradually (it prepares the links one by one): a listing that grew since
+    -- the last look is "still filling" - it is re-checked every few seconds while you look at it and never counts
+    -- as fresh in the cache until two checks in a row return the same number of entries.
+    local oldn = old and type(old.entries) == "table" and #old.entries or nil
+    MS.seen[href] = (MS.seen[href] or 0) + 1
+    local g = MS.grow[href]
+    if oldn and #entries > oldn then
+        MS.grow[href] = { n = #entries, stable = 0, t = os.time() }
+        dir_cache[href].stale = true
+    elseif g then
+        g.stable = g.stable + 1
+        if g.stable >= 2 then MS.grow[href] = nil else dir_cache[href].stale = true end
+    end
+    if href == current_path then
+        if MS.grow[href] then status_line = string.format("Real-Debrid is still adding files to this folder…  %d so far", #entries)
+        elseif g and status_line:find("still adding files", 1, true) then status_line = string.format("All %d entries listed", #entries) end
+    end
 end
 
 apply_dir_result = function(href, entries)
@@ -1286,10 +1335,10 @@ fetch_listing = function(href, opts, on_done)
             file_entries = files
             after_files_set()
         end
-        if not opts.silent and opts.status then status_line = "Loaded: " .. (U.basename(href) ~= "" and U.basename(href) or "root") end
+        if not opts.silent and opts.status and not MS.grow[href] then status_line = "Loaded: " .. (U.basename(href) ~= "" and U.basename(href) or "root") end
         render()
         -- during a library crawl write less often (every ~30 s): the data file holds the whole index
-        debounced_save_persistence(opts.silent and (MS.idx_running and 30 or 8) or 3)
+        debounced_save_persistence(opts.silent and (MS.idx_running and 30 or 8) or 3, "cache")
         finish(true)
     end)
 end
@@ -1501,18 +1550,48 @@ local function ensure_http_options()
     pcall(mp.set_property, "demuxer-max-back-bytes", string.format("%dMiB", math.floor(tonumber(o.demuxer_max_back_bytes_mb) or 256)))
 end
 
-local function queue_load(url, mode)
+-- Playlist entries get the FILE NAME as their title (instead of the long stream link) by loading
+-- them through an in-memory m3u ("#EXTINF:-1,<name>"). mpv shows that title in the playlist and
+-- as the media title. Falls back to a plain loadfile when loadlist refuses (very old mpv).
+local function m3u_title(t)
+    t = tostring(t or ""):gsub("[\r\n]+", " ")
+    return t
+end
+local function queue_many(items, mode)
     ensure_http_options()
-    mp.commandv("loadfile", url, mode)
+    if #items == 0 then return end
+    local lines = { "#EXTM3U" }
+    for _, it in ipairs(items) do
+        if it.title and it.title ~= "" then lines[#lines + 1] = "#EXTINF:-1," .. m3u_title(it.title) end
+        lines[#lines + 1] = it.url
+    end
+    local list = "memory://" .. table.concat(lines, "\n")
+    local insert = mode:find("^insert%-next") ~= nil
+    -- mpv < 0.38 has no insert-next for loadlist: append instead (keeps the titles); asked once, then remembered
+    if not (insert and MS.no_insert_next) then
+        if mp.commandv("loadlist", list, mode) then return end
+        if insert then MS.no_insert_next = true end
+    end
+    if insert and mp.commandv("loadlist", list, mode == "insert-next-play" and "append-play" or "append") then return end
+    -- fallback: plain loadfile (no titles)
+    local first = true
+    for _, it in ipairs(items) do
+        local m = mode
+        if not first then m = "append" end
+        if not mp.commandv("loadfile", it.url, m) and m:find("^insert%-next") then
+            mp.commandv("loadfile", it.url, m == "insert-next-play" and "append-play" or "append")
+        end
+        first = false
+    end
+end
+local function queue_load(url, mode, title)
+    queue_many({ { url = url, title = title } }, mode)
 end
 
 -- Queue `url` directly AFTER the current file (so it plays next even if you queued other things
 -- with 'a'); older mpv without "insert-next" falls back to appending.
-local function queue_next(url)
-    ensure_http_options()
-    if not mp.commandv("loadfile", url, "insert-next") then
-        mp.commandv("loadfile", url, "append")
-    end
+local function queue_next(url, title)
+    queue_many({ { url = url, title = title } }, "insert-next")
 end
 
 -- ---------- Continue Watching (virtual list) ----------
@@ -1659,7 +1738,7 @@ play_entry = function(entry, append)
     if append then
         -- Manual "queue" action ('a' key) - just append, no auto-chaining needed.
         pending_meta[stream_url] = { href = entry.href, name = entry.name, dirpath = dirpath }
-        queue_load(stream_url, "append-play")
+        queue_load(stream_url, "append-play", entry.name)
         status_line = "Queued: " .. entry.name
         return
     end
@@ -1675,7 +1754,7 @@ play_entry = function(entry, append)
     pending_meta[stream_url] = meta
     loading_meta = meta
 
-    queue_load(stream_url, "replace")
+    queue_load(stream_url, "replace", entry.name)
     status_line = "Playing: " .. entry.name
     if o.auto_close_on_play then close_pending_for = stream_url end
 end
@@ -1763,7 +1842,7 @@ function MS.fb_play()
     fb.local_url = "ffmpeg://file:" .. fb.path
     pending_meta[fb.local_url] = fb.meta
     loading_meta = fb.meta
-    queue_load(fb.local_url, "replace")
+    ensure_http_options(); mp.commandv("loadfile", fb.local_url, "replace")   -- local growing file: plain loadfile
     if o.auto_close_on_play then close_pending_for = fb.local_url end
 end
 
@@ -2258,6 +2337,7 @@ end
 -- ============================================================
 MS.global_total = 0           -- total matches before the index_max_results cut-off
 MS.flat, MS.flat_built_at, MS.flat_version, MS.cache_version = nil, 0, -1, 0
+MS.grow, MS.seen = {}, {}         -- folders whose listing is still growing / how often each was listed this session
 
 -- "ep2" sorts before "ep10": zero-pad digit runs so plain string comparison gives natural order
 local function pad_digits(s)
@@ -2347,6 +2427,7 @@ start_search = function(scope)
     if not browser_active or search_active then return end
     scope = scope or focus_panel
     search_query = ""   -- every new search starts empty (the old query used to linger and look like a dead search box)
+    MS.scur = 0
     search_results, MS.global_total = {}, 0
     search_scope = scope
     search_active = true
@@ -2389,20 +2470,55 @@ cancel_search = function()
     render()
 end
 
-search_append = function(ch)
-    search_query = search_query .. ch
+-- Text cursor in the search box: MS.scur = bytes before it. Left / Right / Home / End / Ctrl+arrows / Del edit in place.
+function MS.s_cont(s, i) local b = s:byte(i); return b and b >= 128 and b < 192 end
+function MS.scur_get() MS.scur = math.max(0, math.min(#search_query, MS.scur or #search_query)); return MS.scur end
+function MS.scur_prev(q, c) c = c - 1; while c > 0 and MS.s_cont(q, c + 1) do c = c - 1 end; return math.max(0, c) end
+function MS.scur_next(q, c) c = c + 1; while c < #q and MS.s_cont(q, c + 1) do c = c + 1 end; return math.min(#q, c) end
+function MS.search_changed()
     if search_scope == "global" then run_global_search() end
     search_reset_selection()
     render()
 end
 
+search_append = function(ch)
+    local c = MS.scur_get()
+    search_query = search_query:sub(1, c) .. ch .. search_query:sub(c + 1)
+    MS.scur = c + #ch
+    MS.search_changed()
+end
+
 search_backspace = function()
-    if #search_query > 0 then
-        search_query = U.utf8_pop(search_query)
-        if search_scope == "global" then run_global_search() end
-        search_reset_selection()
-        render()
+    local c = MS.scur_get()
+    if c == 0 then return end
+    local p = MS.scur_prev(search_query, c)
+    search_query, MS.scur = search_query:sub(1, p) .. search_query:sub(c + 1), p
+    MS.search_changed()
+end
+
+function MS.search_delete()
+    local c = MS.scur_get()
+    if c >= #search_query then return end
+    search_query = search_query:sub(1, c) .. search_query:sub(MS.scur_next(search_query, c) + 1)
+    MS.search_changed()
+end
+
+-- dir = -1 / 1 one character, -2 / 2 one word, "home" / "end"
+function MS.scur_move(dir)
+    local q, c = search_query, MS.scur_get()
+    if dir == "home" then c = 0
+    elseif dir == "end" then c = #q
+    elseif dir == -1 then c = MS.scur_prev(q, c)
+    elseif dir == 1 then c = MS.scur_next(q, c)
+    elseif dir == -2 then
+        while c > 0 and q:sub(c, c) == " " do c = c - 1 end
+        while c > 0 and q:sub(c, c) ~= " " do c = c - 1 end
+    elseif dir == 2 then
+        while c < #q and q:sub(c + 1, c + 1) == " " do c = c + 1 end
+        while c < #q and q:sub(c + 1, c + 1) ~= " " do c = c + 1 end
     end
+    MS.scur = c
+    render()
 end
 
 -- ============================================================
@@ -2524,7 +2640,8 @@ local function draw_search_indicator(chunks, rect, y, match_count, big)
         local pad = 8
         table.insert(chunks, D.ev_rect(rect.x1 + pad, y - fs_big * 0.72, rect.x2 - pad, y + fs_big * 0.5,
             THEME.accent, 16, THEME.accent, 55, 1, o.corner_radius_small))
-        local text = string.format("{\\b0}%s{\\b1} %s▏", ICONS.search, U.ass_escape(search_query))
+        local c = MS.scur_get and MS.scur_get() or #search_query
+        local text = string.format("{\\b0}%s{\\b1} %s▏%s", ICONS.search, U.ass_escape(search_query:sub(1, c)), U.ass_escape(search_query:sub(c + 1)))
         table.insert(chunks, D.ev_text(rect.x1 + pad + 10, y, 4,
             string.format("%s\\b1\\fs%d\\c%s", clip, fs_big, U.ass_color(THEME.accent)), text))
         table.insert(chunks, D.ev_text(rect.x2 - pad - 10, y, 6,
@@ -2652,9 +2769,8 @@ local function draw_scrollbar(chunks, rect, header_h, scroll, n_items, n_vis, pa
     local dragging = MS.drag and MS.drag.panel == panel
     local hot = dragging or (MS.hover_sb == panel)
     local bx1 = hot and (x1 - 2) or x1
-    table.insert(chunks, D.ev_rect(bx1, y1, x2, y2, THEME.track, hot and 100 or 100, nil, 0, 0, o.corner_radius_small))
+    table.insert(chunks, D.ev_rect(bx1, y1, x2, y2, THEME.track, 100, nil, 0, 0, o.corner_radius_small))
     table.insert(chunks, D.ev_rect(bx1, thumb_y, x2, thumb_y + thumb_h, THEME.accent, hot and 100 or 80, nil, 0, 0, o.corner_radius_small))
-    local half = math.floor(o.scrollbar_hit_px / 2)
     layout.scrollbars[panel] = {
         hx1 = x2 - o.scrollbar_hit_px, hx2 = rect.x2, y1 = y1, y2 = y2,
         ty1 = thumb_y, ty2 = thumb_y + thumb_h, track_h = track_h, thumb_h = thumb_h,
@@ -2675,32 +2791,101 @@ CT.TOKENS = {
     "av1", "hdr", "dovi", "atmos", "dts", "ddp", "dd%+",
 }
 
+-- Characters some upload tools substitute for ones Windows forbids in file names ("Time?!" saved as U+F025),
+-- plus the double-encoded form of the same ("ï€¥"). Turned back into the real character for display.
+CT.SFM = { [0xF020] = '"', [0xF021] = "*", [0xF022] = ":", [0xF023] = "<", [0xF024] = ">", [0xF025] = "?",
+    [0xF026] = "\\", [0xF027] = "|", [0xF028] = " ", [0xF029] = "." }
+function CT.fix_chars(s)
+    if not s or not s:find("[\195\239\234]") then return s end
+    local function map(cp)
+        local m = CT.SFM[cp]
+        if m then return m end
+        if cp >= 0xF030 and cp <= 0xF07F then return string.char(cp - 0xF000) end
+        return nil
+    end
+    s = s:gsub("\239([\128\129])([\128-\191])", function(b2, b3)
+        local cp = 0xF000 + (b2:byte() - 0x80) * 64 + (b3:byte() - 0x80)
+        return map(cp) or ("\239" .. b2 .. b3)
+    end)
+    -- the same bytes read as Windows-1252 and saved again as UTF-8: "ï" "€" + (C2 xx)
+    s = s:gsub("\195\175\226\130\172\194([\160-\191])", function(b3)
+        return map(0xF000 + (b3:byte() - 0x80)) or ("\195\175\226\130\172\194" .. b3)
+    end)
+    s = s:gsub("\234\158\137", ":")                            -- U+A789 colon look-alike
+    return s
+end
+
+-- words that end an episode title taken from a file name ("S02E01.You.Arent.E.Rank.Are.You.1080p.WEB")
+CT.EP_STOP = {}
+for w in ([[1080p 2160p 720p 480p 1080i 4k uhd web webdl web-dl webrip bluray blu-ray bdrip brrip bd hdtv dvdrip remux
+    x264 x265 h264 h265 hevc avc av1 hdr hdr10 dv dovi atmos dts ddp dd aac flac opus multi dual dubbed subbed
+    proper repack internal real vostfr nf amzn dsnp atvp hmax max hulu pcok cr crunchyroll hidive ita eng fre ger spa
+    jpn kor 10bit 8bit hi10p complete]]):gmatch("%S+") do CT.EP_STOP[w] = true end
+
+-- Episode title from the part of a file name that follows the episode token.
+function CT.ep_title(rest)
+    if not rest or rest == "" then return nil end
+    rest = rest:gsub("^[%s%._%-:]+", "")
+    if rest:find("^[eE]%d") or rest:find("^%-") then return nil end    -- "S01E01-E13" ranges
+    if rest:find("^[%[%(]") then return nil end
+    local words = {}
+    for w in rest:gsub("[%._]", " "):gmatch("%S+") do
+        local lw = w:lower():gsub("[%[%]%(%)]", "")
+        if CT.EP_STOP[lw] or lw:find("^%d%d%d%d?p$") or w:find("^[%[%(]") then break end
+        if lw:find("^%d%d%d%d$") and tonumber(lw) >= 1900 and tonumber(lw) <= 2099 then break end
+        words[#words + 1] = w
+        if #words >= 16 then break end
+    end
+    local t = table.concat(words, " "):gsub("%s*%-%s*$", "")
+    t = t:gsub("^%-%s*", ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if not t:find("%a%a") then return nil end
+    return t
+end
+
 function CT.parse_raw(name)
-    local base = name
-    local ext = U.ext_of(name)
+    local base = CT.fix_chars(name)
+    local ext = U.ext_of(base)
     if ext and (U.video_exts[ext:lower()] or U.audio_exts[ext:lower()]) then
-        base = name:sub(1, #name - #ext - 1)
+        base = base:sub(1, #base - #ext - 1)
     end
     local lower = base:lower()
 
     -- season/episode token: must start a "word" (so "class01e02" doesn't match)
-    local cut, se_label = nil, nil
+    local cut, se_label, ep_from = nil, nil, nil
     local init = 1
     while true do
-        local a, _, s, e = lower:find("s(%d%d?)e(%d%d%d?)", init)
+        local a, b, s, e = lower:find("s(%d%d?)[%._%s]?e(%d%d%d?%d?)", init)
         if not a then break end
         if a == 1 or not lower:sub(a - 1, a - 1):match("%w") then
             se_label = string.format("S%02dE%02d", tonumber(s), tonumber(e))
-            cut = a - 1
+            cut, ep_from = a - 1, b + 1
             break
         end
         init = a + 1
     end
-    if not se_label then   -- anime style: "Show Name - 03 [1080p]"
-        local a, _, e = lower:find("%s%-%s(%d%d%d?)[%s%[%(%.]")
-        if a then se_label = string.format("E%02d", tonumber(e)); cut = a - 1 end
+    if not se_label then   -- "1x05"
+        local a, b, s, e = lower:find("%f[%w](%d%d?)x(%d%d%d?)%f[%W]")
+        if a and tonumber(s) < 60 then
+            se_label = string.format("S%02dE%02d", tonumber(s), tonumber(e)); cut, ep_from = a - 1, b + 1
+        end
+    end
+    if not se_label then   -- "Episode 001 Title", "Ep 10 - Title", "Episode.10"
+        local a, b, e = lower:find("%f[%w]episode[%s%._%-]*(%d%d?%d?%d?)%f[%D]")
+        if not a then a, b, e = lower:find("%f[%w]ep[%s%._%-]*(%d%d?%d?%d?)%f[%D]") end
+        if a then se_label = string.format("E%02d", tonumber(e)); cut, ep_from = a - 1, b + 1 end
+    end
+    if not se_label then   -- anime style: "Show Name - 03 [1080p]" / "Show Name - 03 - Title"
+        local a, b, e = lower:find("%s%-%s(%d%d%d?%d?)[%s%[%(%.]")
+        if not a then a, b, e = lower:find("%s%-%s(%d%d%d?%d?)$") end
+        if a then
+            local v = tonumber(e)
+            if not (v >= 1900 and v <= 2099 and #e == 4) and v ~= 1080 and v ~= 720 and v ~= 2160 then
+                se_label = string.format("E%02d", v); cut, ep_from = a - 1, b
+            end
+        end
     end
 
+    local year
     if not se_label then
         -- absolute numbering: "Show.2009.004.1080p.BD" / "Show - 004 [1080p]" -> E04. A bare 3-4 digit number counts only when
         -- a year came before it or a quality tag follows it, so "The.300.Spartans.1962" is left alone.
@@ -2752,6 +2937,7 @@ function CT.parse_raw(name)
     title = title:gsub("^%b[]%s*", "")
     title = title:gsub("[%._]+", " "):gsub("%s+", " "):gsub("^[%s%-]+", ""):gsub("[%s%-%(%[]+$", "")
     if title == "" and not se_label then return false end
+    local ep = ep_from and CT.ep_title(base:sub(ep_from)) or nil
 
     local chips = {}
     local function has(pat) return lower:find(pat) ~= nil end
@@ -2767,7 +2953,7 @@ function CT.parse_raw(name)
     if has("dual[%._%s%-]?audio") then chips[#chips + 1] = "DUAL" end
 
     return {
-        title = title, se = se_label, year = year, chips = chips,
+        title = title, se = se_label, year = year, chips = chips, ep = ep,
         label = se_label or (title .. (year and (" (" .. year .. ")") or "")),
     }
 end
@@ -2838,11 +3024,21 @@ function CT.chips_for(lower)
 end
 
 function CT.parse_folder_raw(name)
-    local base = name
+    local base = CT.fix_chars(name)
     local group
-    local lead = base:match("^%[([^%]]+)%]")                 -- anime style: "[SubsPlease] Show ..."
-    if lead and #lead >= 2 and #lead <= 24 then group = lead end
-    local body = base:gsub("^%b[]%s*", "")
+    local body = base
+    for _ = 1, 4 do                                          -- leading tags: "[SubsPlease] Show", "[v2] Show"
+        local lead = body:match("^%[([^%]]+)%]")
+        if not lead then break end
+        local ll = lead:lower()
+        if not group and #lead >= 2 and #lead <= 24 and not ll:find("^v%d+$") and not ll:find("^%d+p$")
+           and not ll:find("^%d+$") then group = lead end
+        body = body:gsub("^%b[]%s*", "")
+    end
+    local alt                                                 -- "(Demon Slayer) Kimetsu no Yaiba ..."
+    local pin, prest = body:match("^%((.-)%)%s*(.+)$")
+    if pin and pin:find("%a%a") and not pin:find("^%d+$") then alt, body = pin, prest end
+    body = body:gsub("^[Bb][Oo][Nn][Dd][%s%._]*50[%s%._%-]+", "")   -- "Bond 50 The Spy Who Loved Me"
     body = body:gsub("%s*%b[]%s*$", "")                       -- trailing [site]/[hash] tags
     body = body:gsub("\234\158\137", ":")                      -- U+A789 (a colon look-alike used in file names) -> ":"
     local g = body:match("%-([%w_]+)$")                       -- scene style: "...-GROUP"
@@ -2901,7 +3097,7 @@ function CT.parse_folder_raw(name)
     if title == "" then return false end
 
     return {
-        title = CT.titlecase(title), season = season, year = year, group = group,
+        title = CT.titlecase(title), season = season, year = year, group = group, alt = alt,
         chips = CT.chips_for(lower),
     }
 end
@@ -3114,6 +3310,24 @@ local function draw_episode_rows(chunks, hitboxes, rect)
     end
 
     local last_idx = math.min(#items, scroll_off + vis)
+    -- Column widths shared by every visible row, so labels, chips, sizes and episode names line up
+    -- (they used to follow each name's estimated text width and drift from row to row).
+    local COL = { label = 0, chips = 0, size = 0 }
+    for i = scroll_off + 1, last_idx do
+        local it = items[i]
+        local cp = (clean and it and not it.is_dir and U.is_media(it.name)) and CT.parse(it.name) or nil
+        if cp and cp.se then
+            COL.label = math.max(COL.label, U.utf8_len(cp.se) * fs * 0.62)
+            local cw = 0
+            if o.clean_titles_chips then
+                for _, c in ipairs(cp.chips) do cw = cw + U.utf8_len(c) * cfs * 0.62 + 12 + 5 end
+            end
+            if it.cw == "next" then cw = cw + 4 * cfs * 0.62 + 17 end
+            COL.chips = math.max(COL.chips, cw)
+            if it.size and it.size > 0 then COL.size = math.max(COL.size, U.utf8_len(U.fmt_bytes(it.size)) * (fs - 6) * 0.58 + 12) end
+            COL.any = true
+        end
+    end
     for i = scroll_off + 1, last_idx do
         local item = items[i]
         local row_y1 = body_y1 + (i - scroll_off - 1) * row_h
@@ -3168,7 +3382,7 @@ local function draw_episode_rows(chunks, hitboxes, rect)
 
         -- clean title + chips
         local cp = (clean and not item.is_dir and U.is_media(item.name)) and CT.parse(item.name) or nil
-        local shown_name, name_suffix = item.name, ""
+        local shown_name, name_suffix = CT.fix_chars(item.name), ""
         local chip_labels = {}
         if cp then
             if cp.se then
@@ -3185,6 +3399,47 @@ local function draw_episode_rows(chunks, hitboxes, rect)
         end
         if item.cw == "next" then table.insert(chip_labels, 1, "NEXT") end
         if item.cw == "resume" and hist and hist.pos then table.insert(chip_labels, 1, U.fmt_time(hist.pos)) end
+
+        local columns = cp and cp.se and COL.any
+        if columns then
+            -- E01 | chips | size | episode name (title first when the folder mixes shows)
+            local tail = {}
+            if not uniform and cp.title ~= "" then tail[#tail + 1] = cp.title end
+            if cp.ep then tail[#tail + 1] = cp.ep end
+            local tail_txt = table.concat(tail, "  ·  ")
+            local x_label = name_x + 30
+            local x_chips = x_label + COL.label + 14
+            local x_size = x_chips + COL.chips
+            local x_ep = x_size + COL.size + (COL.size > 0 and 10 or 0)
+            local x_end = rect.x2 - right_w - 8
+            local status_txt = ""
+            if o.show_watched_status and not use_right_status then
+                if watched_set[item.href] then status_txt = ICONS.watched
+                elseif hist then status_txt = ICONS.watching end
+            end
+            table.insert(chunks, D.ev_text(name_x, name_y, 4, string.format("%s\\fs%d\\c%s", clip, fs, U.ass_color(icon_col)), icon))
+            table.insert(chunks, D.ev_text(x_label, name_y, 4, string.format("%s\\fs%d\\c%s", clip, fs, U.ass_color(name_col)),
+                U.ass_escape(shown_name)))
+            local cx = x_chips
+            if x_size <= x_end then
+                for k = 1, #chip_labels do cx = draw_chip(cx, name_y, chip_labels[k], CT.chip_color(chip_labels[k])) end
+            end
+            if item.size and item.size > 0 and x_ep <= x_end + 10 then
+                table.insert(chunks, D.ev_text(x_size, name_y, 4,
+                    string.format("%s\\fs%d\\c%s", clip, fs - 6, U.ass_color(THEME.text_dim)), U.ass_escape(U.fmt_bytes(item.size))))
+            end
+            if x_end - x_ep > 30 and (tail_txt ~= "" or status_txt ~= "") then
+                local rowclip = D.clip_tag(x_ep, body_y1, math.min(body_x2, x_end), body_y2)
+                local fit = U.fit_text(tail_txt, x_end - x_ep - (status_txt ~= "" and 26 or 0), fs - 4)
+                local st = (status_txt ~= "") and string.format("{\\c%s}  %s", U.ass_color(watched_set[item.href] and THEME.good or THEME.warn), status_txt) or ""
+                table.insert(chunks, D.ev_text(x_ep, name_y, 4, string.format("%s\\fs%d\\c%s", rowclip, fs - 4,
+                    U.ass_color(is_sel and THEME.accent or THEME.text_muted)), U.ass_escape(fit) .. st))
+            end
+            if right_text then
+                table.insert(chunks, D.ev_text(rect.x2 - 16 - scroll_pad, name_y, 6,
+                    string.format("%s\\fs%d\\c%s", clip, fs - 6, U.ass_color(right_col)), U.ass_escape(right_text)))
+            end
+        end
 
         local chips_w = 0
         for _, c in ipairs(chip_labels) do chips_w = chips_w + U.utf8_len(c) * cfs * 0.62 + 12 + 5 end
@@ -3219,6 +3474,7 @@ local function draw_episode_rows(chunks, hitboxes, rect)
         local display_name = U.fit_text(shown_name, max_name_px, fs)
         if item.is_dir then display_name = display_name .. "/" end
 
+        if not columns then
         local line = string.format("{\\c%s}%s  {\\c%s}%s%s%s",
             U.ass_color(icon_col), icon, U.ass_color(name_col), U.ass_escape(display_name), name_suffix, status)
         table.insert(chunks, D.ev_text(name_x, name_y, 4, string.format("%s\\fs%d", clip, fs), line))
@@ -3240,2345 +3496,6 @@ local function draw_episode_rows(chunks, hitboxes, rect)
             table.insert(chunks, D.ev_text(cx + 2, name_y, 4,
                 string.format("%s\\fs%d\\c%s", clip, fs - 6, U.ass_color(THEME.text_dim)), U.ass_escape(size_text)))
         end
-
-        if hist and hist.pos and hist.duration and hist.duration > 0 and not item.is_dir then
-            local pct = math.min(1, hist.pos / hist.duration)
-            local bx1, bx2 = name_x, rect.x2 - 14
-            local by1, by2 = row_y2 - 4, row_y2 - 2
-            table.insert(chunks, D.ev_rect(bx1, by1, bx2, by2, THEME.track, 100, nil, 0, 0, o.corner_radius_small))
-            table.insert(chunks, D.ev_rect(bx1, by1, bx1 + (bx2 - bx1) * pct, by2, THEME.accent, 100, nil, 0, 0, o.corner_radius_small))
-        end
-
-        table.insert(hitboxes, {
-            panel = "episodes", index = i,
-            x1 = rect.x1, y1 = row_y1, x2 = rect.x2, y2 = row_y2,
-        })
-    end
-
-    if #items == 0 then
-        local msg2 = "(no files)"
-        if is_global then
-            msg2 = (search_query == "") and "Type to search the folders you have opened" or "(no matches in the folders you have opened)"
-        elseif search_scope == "episodes" and search_query ~= "" then
-            msg2 = "(no matches)"
-        elseif current_path == CW_HREF then
-            msg2 = "Nothing to continue yet - watch something and it will show up here"
-        elseif hide_watched and #file_entries > 0 then
-            msg2 = "(everything here is watched - press H to show watched files)"
-        end
-        table.insert(chunks, D.ev_text(rect.x1 + 14, rect.y1 + header_h + 22, 4,
-            string.format("\\i1\\fs%d\\c%s", fs - 4, U.ass_color(THEME.text_dim)), U.ass_escape(msg2)))
-    end
-
-    draw_scrollbar(chunks, rect, header_h, scroll_off, #items, vis, "episodes")
-    if last_idx < #items then
-        table.insert(chunks, D.ev_text((rect.x1 + rect.x2) / 2, rect.y2 - 10, 5,
-            string.format("\\fs%d\\c%s", fs - 8, U.ass_color(THEME.accent)), "▼"))
-    end
-end
-
--- ============================================================
--- MAIN RENDER
--- ============================================================
--- ---------- debug overlay ('d') ----------
-function U.table_count(tbl) local n = 0 for _ in pairs(tbl) do n = n + 1 end return n end
-
-local function build_debug_lines()
-    local L = {}
-    local dirs, items = IDX.count_items()
-    local cached = find_cached_dir(current_path)
-    local rs = req_stats.last
-    L[#L + 1] = "DEBUG  -  webdav-browser " .. SCRIPT_VERSION
-    L[#L + 1] = "folder: " .. current_path
-    L[#L + 1] = "listing: " .. (cached and (string.format("cached %s (%s)", U.fmt_age(cached.ts),
-        cache_is_fresh(cached) and "fresh" or "stale")) or "not cached")
-    L[#L + 1] = string.format("cache: %d folders, %d items, ttl %ds", dirs, items, o.cache_ttl)
-    if rs then
-        L[#L + 1] = "last request: " .. rs.path
-        L[#L + 1] = string.format("   %d ms   HTTP %s   attempts %d   %s", rs.ms or 0, tostring(rs.code or "-"),
-            rs.attempts or 1, U.fmt_age(rs.ts))
-        if rs.err then L[#L + 1] = "   error: " .. rs.err end
-    else
-        L[#L + 1] = "last request: none yet"
-    end
-    L[#L + 1] = string.format("requests: %d total, %d failed, %d in flight", req_stats.total, req_stats.failures, req_stats.pending)
-    L[#L + 1] = IDX.summary()
-    L[#L + 1] = string.format("persistence: %s%s", persist_status.ok and "ok" or ("FAILED - " .. tostring(persist_status.err)),
-        persist_status.last_save and (", saved " .. U.fmt_age(persist_status.last_save)) or ", not saved yet")
-    L[#L + 1] = "data file: " .. tostring(persist_status.path)
-    L[#L + 1] = string.format("auth: %s    blur: %s", o.scoped_auth and "scoped (file-local)" or "session-wide", MS.blur_state or "off")
-    do
-        local ok, chain = pcall(mp.get_property_native, "vf")
-        local names = {}
-        if ok and type(chain) == "table" then
-            for _, f in ipairs(chain) do names[#names + 1] = (f.label and ("@" .. f.label) or tostring(f.name)) end
-        end
-        L[#L + 1] = "video filters: " .. (#names > 0 and table.concat(names, ", ") or "none")
-    end
-    do
-        local fb = MS.fb
-        if fb.active then
-            L[#L + 1] = string.format("download-play: %s %s / %s%s", fb.playing and "playing" or "buffering",
-                U.fmt_bytes(fb.size or 0), fb.total and U.fmt_bytes(fb.total) or "?", fb.done and "  (complete)" or "")
-        end
-    end
-    L[#L + 1] = string.format("posters: %s, tmdb_key %s, status %s%s", o.experimental_posters and "on" or "OFF (experimental_posters=no)",
-        o.tmdb_key ~= "" and (#o.tmdb_key .. " chars") or "MISSING", tostring(PS and PS.status or "?"), PS and PS.err and (" - " .. PS.err) or "")
-    if MS.debug_extra then for _, ln in ipairs(MS.debug_extra()) do L[#L + 1] = ln end end
-    L[#L + 1] = string.format("credentials: user '%s', password %d chars, curl via %s", o.user, #o.pass, U.auth_mode())
-    for _, n in ipairs(U.conf_notes or {}) do L[#L + 1] = "config: " .. n end
-    L[#L + 1] = string.format("watch tracking: %d in progress, %d watched", U.table_count(watch_history), U.table_count(watched_set))
-    local errs = U.table_count(listing_error)
-    if errs > 0 then L[#L + 1] = string.format("folders with errors: %d", errs) end
-    return L
-end
-
--- ============================================================
--- POSTERS (EXPERIMENTAL - poster edition only)
--- Looks the open folder's title up on TMDB, downloads the poster, converts it to raw BGRA and shows it
--- in a reserved column on the right with mpv's overlay-add. The bitmap is drawn ABOVE all text, so the
--- column is kept free of other UI and the picture is removed whenever something could cover it.
--- This product uses the TMDB API but is not endorsed or certified by TMDB.
--- ============================================================
-PS = { ID = 63, gen = 0, status = "idle", info = nil, want = nil, shown = nil, timer = nil, idx = nil, dir_ok = false }
-
-PS.PS1 = [[
-param([string]$In, [string]$Out, [int]$W, [int]$H)
-Add-Type -AssemblyName System.Drawing
-$src = [System.Drawing.Image]::FromFile($In)
-$fmt = [System.Drawing.Imaging.PixelFormat]::Format32bppPArgb
-$bmp = New-Object System.Drawing.Bitmap($W, $H, $fmt)
-$g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-$g.DrawImage($src, 0, 0, $W, $H)
-$g.Dispose(); $src.Dispose()
-$rect = New-Object System.Drawing.Rectangle(0, 0, $W, $H)
-$data = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, $fmt)
-$bytes = New-Object byte[] ($data.Stride * $H)
-[System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
-$bmp.UnlockBits($data); $bmp.Dispose()
-[System.IO.File]::WriteAllBytes($Out, $bytes)
-]]
-
-PS.GENERIC = { season = true, seasons = true, specials = true, special = true, extras = true, extra = true, subs = true, sample = true }
-
-function PS.enabled()
-    return o.experimental_posters and o.tmdb_key ~= ""
-end
-
-function PS.dir()
-    if PS._dir then return PS._dir end
-    local d = o.poster_cache_dir
-    if d == "" then
-        local base = data_dir()
-        d = base and utils.join_path(base, "webdav_posters")
-            or ((os.getenv("TEMP") or os.getenv("TMP") or os.getenv("TMPDIR") or "/tmp"):gsub("\\", "/") .. "/webdav_posters")
-    end
-    PS._dir = (d:gsub("\\", "/"):gsub("/+$", ""))
-    return PS._dir
-end
-
--- Creates the cache folder (mpv has no mkdir of its own).
-function PS.mkdir()
-    local d = PS.dir()
-    if PS._made then return end
-    local is_win = package.config:sub(1, 1) == "\\"
-    local args = is_win and { "cmd", "/c", "mkdir", (d:gsub("/", "\\")) } or { "mkdir", "-p", d }
-    pcall(mp.command_native, { name = "subprocess", args = args, capture_stdout = true, capture_stderr = true, playback_only = false })
-    PS._made = true
-end
-
-function PS.run(args, cb)
-    mp.command_native_async({
-        name = "subprocess", args = args, capture_stdout = true, capture_stderr = true, playback_only = false,
-    }, function(success, res, err)
-        if not success or not res then cb(nil, err or "could not start the program") return end
-        cb(res, nil)
-    end)
-end
-
-function PS.norm(s) return (tostring(s):lower():gsub("[^%w]+", "")) end
-
--- Title (and year) of a folder NAME; nil for generic names ("Season 1", "Specials"...) so callers can look further up.
-function PS.title_of_name(name)
-    local fp = o.experimental_clean_titles and CT.parse_folder(name) or nil
-    local title, year
-    if fp and fp.title then
-        title, year = fp.title, fp.year
-    else
-        title = name:gsub("\234\158\137", ":"):gsub("[%._]+", " "):gsub("%[[^%]]*%]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-        year = title:match("%((%d%d%d%d)%)")
-        title = title:gsub("%(%d%d%d%d%)", ""):gsub("%s+$", "")
-        title = CT.strip_tail(title)
-    end
-    local first = title:lower():match("^(%a+)")
-    local generic = (first and PS.GENERIC[first] and #title < 14) or title:match("^[Ss]%d+$")
-    if title == "" or #title < 2 or generic then return nil end
-    return title, year and tostring(year) or ""
-end
-
--- Title of a folder path: the folder itself, or the nearest parent with a real title. Never the library root.
-function PS.title_of_path(p)
-    for _ = 1, 4 do
-        local pn = p:gsub("/+$", "")
-        if pn == "" or pn == root_href:gsub("/+$", "") then return nil end
-        local t, y = PS.title_of_name(U.basename(p))
-        if t then return t, y end
-        p = U.dirname(p)
-    end
-    return nil
-end
-
--- Title (and year) to look up for the folder open in the files panel.
-function PS.target()
-    if search_scope == "global" or current_path == CW_HREF then return nil end
-    return PS.title_of_path(current_path)
-end
-
-PS.IDX_VERSION = 4     -- bump when the matching rules change: older lookups (and "not found" results) are dropped once
-function PS.load_index()
-    if PS.idx then return end
-    PS.idx = { __v = PS.IDX_VERSION }
-    local f = io.open(PS.dir() .. "/index.json", "rb")
-    if f then
-        local txt = f:read("*a"); f:close()
-        local ok, data = pcall(utils.parse_json, txt)
-        if ok and type(data) == "table" then
-            data = U.plain(data)
-            if data.__v == PS.IDX_VERSION then PS.idx = data end
-        end
-    end
-end
-
-function PS.save_index()
-    local txt = utils.format_json(PS.idx)
-    if not txt then return end
-    pcall(atomic_write, PS.dir() .. "/index.json", txt)
-end
-
--- ---- the lookup / download / convert chain -------------------------------------------------
--- Search strings to try, best first, for one folder name.
-function PS.queries(raw, title, year)
-    local out, seen = {}, {}
-    local function add(q)
-        if not q then return end
-        q = q:gsub("\234\158\137", ":"):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-        if #q >= 2 and not seen[q:lower()] then seen[q:lower()] = true; out[#out + 1] = q end
-    end
-    add(title)
-    local r = tostring(raw or ""):gsub("\234\158\137", ":"):gsub("%b[]", " "):gsub("%b()", " "):gsub("[%._]+", " ")
-    r = r:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    r = CT.strip_tail(r)
-    add(r)
-    for _, base in ipairs({ title or "", r }) do
-        add(base:match("^(.-)%s+%-%s+"))
-        add(base:match("^(.-):"))
-    end
-    local words = {}
-    for w in tostring(title or r):gmatch("%S+") do words[#words + 1] = w end
-    for n = #words - 1, 2, -1 do add(table.concat(words, " ", 1, n)) end
-    if #words >= 2 and #words[1] >= 4 then add(words[1]) end
-    return out
-end
-
--- Best result. kindpref = "tv" | "movie" | "" (a season tag in the folder name means TV; a bare year means a film).
--- strict: only results whose name relates to the query count; the best unrelated one is handed back as `any`.
-function PS.pick(results, title, year, kindpref, strict)
-    local best, best_score, any
-    local want = PS.norm(title)
-    for _, r in ipairs(results or {}) do
-        if (r.media_type == "tv" or r.media_type == "movie") and r.poster_path and r.poster_path ~= "" then
-            local date = r.first_air_date or r.release_date or ""
-            local nm, on = PS.norm(r.name or r.title or ""), PS.norm(r.original_name or r.original_title or "")
-            local exact = (nm == want or on == want)
-            local related = exact or (#want >= 4 and ((nm ~= "" and (nm:find(want, 1, true) or want:find(nm, 1, true)))
-                or (on ~= "" and (on:find(want, 1, true) or want:find(on, 1, true)))))
-            local score = exact and 3 or (related and 1 or 0)
-            local ry = tonumber(date:sub(1, 4)) or 0
-            local wy = tonumber(year) or 0
-            if wy > 0 and ry > 0 then
-                if ry == wy then score = score + 2 elseif math.abs(ry - wy) == 1 then score = score + 1 end
-            end
-            if kindpref and kindpref ~= "" and r.media_type == kindpref then score = score + 1.5 end
-            score = score + math.min(0.9, (tonumber(r.popularity) or 0) / 1000)
-            if not any then any = r end
-            if (not strict or related) and (not best_score or score > best_score) then best, best_score = r, score end
-        end
-    end
-    return best, any
-end
-
-function PS.search(title, year, gen, cb, kindpref, strict)
-    local url = o.tmdb_api_base .. "/search/multi?include_adult=false&query=" .. U.url_encode_segment(title)
-    local args = { o.curl_path, "-s", "-S", "-m", "15", "-w", "\n%{http_code}" }
-    if #o.tmdb_key > 40 then
-        args[#args + 1] = "-H"; args[#args + 1] = "Authorization: Bearer " .. o.tmdb_key
-    else
-        url = url .. "&api_key=" .. o.tmdb_key
-    end
-    args[#args + 1] = url
-    PS.run(args, function(res, err)
-        if gen and gen ~= PS.gen then return end
-        if not res or res.status ~= 0 then cb(nil, "search failed") return end
-        local body, code = res.stdout:match("^(.*)\n(%d%d%d)$")
-        if code == "401" then cb(nil, "TMDB rejected the key") return end
-        if code ~= "200" then cb(nil, "TMDB HTTP " .. tostring(code)) return end
-        local ok, data = pcall(utils.parse_json, body)
-        if not ok or type(data) ~= "table" then cb(nil, "bad reply") return end
-        local best, any = PS.pick(data.results, title, year, kindpref, strict)
-        cb(best or false, nil, any)
-    end)
-end
-
--- Generic TMDB GET. cb(data|nil, err, http_code)
-function PS.api(path, cb)
-    local url = o.tmdb_api_base .. path
-    local args = { o.curl_path, "-s", "-S", "-m", "15", "-w", "\n%{http_code}" }
-    if #o.tmdb_key > 40 then
-        args[#args + 1] = "-H"; args[#args + 1] = "Authorization: Bearer " .. o.tmdb_key
-    else
-        url = url .. (url:find("?", 1, true) and "&" or "?") .. "api_key=" .. o.tmdb_key
-    end
-    args[#args + 1] = url
-    PS.run(args, function(res)
-        if not res or res.status ~= 0 then cb(nil, "request failed", 0) return end
-        local body, code = tostring(res.stdout):match("^(.*)\n(%d%d%d)$")
-        code = tonumber(code) or 0
-        if code == 401 then cb(nil, "TMDB rejected the key", 401) return end
-        if code ~= 200 then cb(nil, "TMDB HTTP " .. code, code) return end
-        local ok, data = pcall(utils.parse_json, body)
-        if not ok or type(data) ~= "table" then cb(nil, "bad reply", code) return end
-        cb(data, nil, 200)
-    end)
-end
-
--- Persistent episode data (episodes.json): one record per show+season, fetched ONCE and kept forever.
-PS.eps, PS.eps_ver = nil, 0
-function PS.load_eps()
-    if PS.eps then return end
-    PS.eps = {}
-    local f = io.open(PS.dir() .. "/episodes.json", "rb")
-    if f then
-        local txt = f:read("*a"); f:close()
-        local ok, data = pcall(utils.parse_json, txt)
-        if ok and type(data) == "table" then PS.eps = U.plain(data) end
-    end
-end
-function PS.save_eps()
-    local txt = safe_json(PS.eps)
-    if not txt then return end
-    if not atomic_write(PS.dir() .. "/episodes.json", txt) then PS.mkdir(); atomic_write(PS.dir() .. "/episodes.json", txt) end
-end
-function PS.ep_info(show, s, e)
-    if not (show and show.id and s and e) then return nil end
-    PS.load_eps()
-    local rec = PS.eps[show.id .. ":" .. s]
-    if type(rec) ~= "table" or rec.none or type(rec.eps) ~= "table" then return nil end
-    return rec.eps[tostring(e)]
-end
--- Fetch (once) season s of a TV show; calls cb() when stored (also for a season TMDB does not know).
-function PS.season(show, s, cb)
-    PS.load_eps()
-    local key = show.id .. ":" .. s
-    if PS.eps[key] ~= nil then cb() return end
-    PS.api(string.format("/tv/%s/season/%d?language=en-US", show.id, s), function(data, err, code)
-        if data and type(data.episodes) == "table" then
-            local rec = { ts = os.time(), eps = {} }
-            for _, ep in ipairs(data.episodes) do
-                local n = tonumber(ep.episode_number)
-                if n then
-                    rec.eps[tostring(n)] = {
-                        n = ep.name or "", o = tostring(ep.overview or ""):sub(1, 400), st = ep.still_path or "",
-                        d = ep.air_date or "", r = tonumber(ep.runtime) or 0, v = tonumber(ep.vote_average) or 0,
-                    }
-                end
-            end
-            PS.eps[key] = rec
-            PS.save_eps()
-        elseif code == 404 then
-            PS.eps[key] = { none = true, ts = os.time() }      -- TMDB has no such season: remember, do not ask again
-            PS.save_eps()
-        else
-            PS.season_err = err
-            cb(err) return
-        end
-        PS.eps_ver = PS.eps_ver + 1
-        cb()
-    end)
-end
--- Overview / backdrop / season count for a show that was cached without them (older cache entries).
-function PS.details(entry, cb)
-    PS.api(string.format("/%s/%s?language=en-US", entry.kind == "movie" and "movie" or "tv", entry.id), function(d)
-        if d then
-            entry.overview = tostring(d.overview or "")
-            entry.backdrop_path = d.backdrop_path or entry.backdrop_path or ""
-            entry.seasons = tonumber(d.number_of_seasons) or entry.seasons
-            entry.vote = tonumber(d.vote_average) or entry.vote
-            local sc = {}
-            local n = 0
-            if type(d.seasons) == "table" then
-                for _, se in ipairs(d.seasons) do
-                    local sn, cnt = tonumber(se.season_number), tonumber(se.episode_count)
-                    if sn and sn >= 1 and cnt then sc[tostring(sn)] = cnt; n = n + 1 end
-                end
-            end
-            entry.sc = (n > 0) and sc or false
-            entry.detail = true
-            PS.save_index()
-            PS.eps_ver = PS.eps_ver + 1
-        end
-        cb()
-    end)
-end
--- Download an image to the cache (never expires). cb(ok)
-function PS.fetch_image(size, path, jpg, cb)
-    local ji = utils.file_info(jpg)
-    if ji and ji.size > 500 then cb(true) return end
-    PS.run({ o.curl_path, "-s", "-S", "-m", "30", "--create-dirs", "-o", jpg, o.tmdb_image_base .. size .. path }, function(res)
-        local info = utils.file_info(jpg)
-        local ok = res and res.status == 0 and info and info.size > 500
-        if not ok then pcall(os.remove, jpg) end
-        cb(ok and true or false)
-    end)
-end
-
--- Cache size (everything in the cache folder; history lives elsewhere and is never counted or touched).
-function PS.stats(force)
-    local now = os.time()
-    if PS.st and not force and now - PS.st.t < 15 and not PS.st_dirty then return PS.st end
-    PS.st_dirty = false
-    local dir = PS.dir()
-    local bytes, files, imgs = 0, 0, 0
-    local list = utils.readdir(dir, "files")
-    if type(list) == "table" then
-        for _, f in ipairs(list) do
-            local info = utils.file_info(dir .. "/" .. f)
-            if info then
-                bytes = bytes + (info.size or 0); files = files + 1
-                if f:match("%.jpg$") then imgs = imgs + 1 end
-            end
-        end
-    end
-    PS.st = { t = now, bytes = bytes, files = files, imgs = imgs }
-    return PS.st
-end
-function PS.clear_cache()
-    local dir = PS.dir()
-    local list = utils.readdir(dir, "files")
-    local n = 0
-    if type(list) == "table" then
-        for _, f in ipairs(list) do
-            if os.remove(dir .. "/" .. f) then n = n + 1 end
-        end
-    end
-    PS.idx, PS.eps = {}, {}
-    PS.eps_ver = PS.eps_ver + 1
-    dir_cache = {}
-    MS.cache_version = MS.cache_version + 1
-    PS.st_dirty = true
-    return n
-end
-
-function PS.convert(jpg, bgra, w, h, cb)
-    local mode = o.poster_converter
-    local is_win = package.config:sub(1, 1) == "\\"
-    if mode == "auto" then mode = is_win and "powershell" or "ffmpeg" end
-    local function done(res, err, tag)
-        if not res or res.status ~= 0 then cb(false, tag .. " failed") else cb(true) end
-    end
-    if mode == "powershell" then
-        local ps = PS.dir() .. "/convert.ps1"
-        local f = io.open(ps, "wb")
-        if not f then cb(false, "cannot write convert script") return end
-        f:write(PS.PS1); f:close()
-        PS.run({ "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps,
-                 jpg, bgra, tostring(w), tostring(h) }, function(r, e) done(r, e, "powershell") end)
-    elseif mode == "ffmpeg" then
-        PS.run({ o.ffmpeg_path, "-v", "error", "-y", "-i", jpg, "-vf", string.format("scale=%d:%d", w, h),
-                 "-pix_fmt", "bgra", "-f", "rawvideo", bgra }, function(r, e) done(r, e, "ffmpeg") end)
-    else
-        PS.run({ o.magick_path, jpg, "-resize", string.format("%dx%d!", w, h), "-depth", "8", "bgra:" .. bgra },
-            function(r, e) done(r, e, "magick") end)
-    end
-end
-
--- Show (or re-show) the converted picture for the current request.
-function PS.draw()
-    local want = PS.want
-    if not (want and want.ready and browser_active and PS.status == "ok") then return end
-    local ok = mp.commandv("overlay-add", tostring(PS.ID), tostring(want.x), tostring(want.y), want.bgra, "0", "bgra",
-        tostring(want.w), tostring(want.h), tostring(want.w * 4))
-    PS.shown = ok and want.key or nil
-end
-
-function PS.hide()
-    PS.gen = PS.gen + 1
-    if PS.timer then PS.timer:kill(); PS.timer = nil end
-    if PS.shown then pcall(mp.commandv, "overlay-remove", tostring(PS.ID)) end
-    PS.shown = nil
-    PS.want = nil
-    PS.status = "idle"
-    PS.info = nil
-end
-
--- Download (if needed) and convert for the size in `want`, then draw.
-function PS.finish_convert(want, gen)
-    local bgra = string.format("%s/p%s_%dx%d.bgra", PS.dir(), want.id, want.w, want.h)
-    local bi = utils.file_info(bgra)
-    if bi and bi.size == want.w * want.h * 4 then
-        want.bgra, want.ready = bgra, true
-        PS.status = "ok"; PS.draw(); render(); return
-    end
-    PS.convert(want.jpg, bgra, want.w, want.h, function(ok, why)
-        if gen ~= PS.gen then return end
-        local bi2 = utils.file_info(bgra)
-        if not ok or not bi2 or bi2.size ~= want.w * want.h * 4 then
-            PS.status, PS.err = "error", why or "bad converted size"
-            render(); return
-        end
-        want.bgra, want.ready = bgra, true
-        PS.status = "ok"; PS.draw(); render()
-    end)
-end
-
-function PS.have_poster(want, entry, gen)
-    PS.info = { name = entry.name, year = entry.year, kind = entry.kind }
-    local jpg = string.format("%s/p%s_%s.jpg", PS.dir(), entry.id, want.size)
-    want.id, want.jpg = entry.id, jpg
-    local ji = utils.file_info(jpg)
-    if ji and ji.size > 1000 then PS.finish_convert(want, gen); return end
-    PS.run({ o.curl_path, "-s", "-S", "-m", "30", "--create-dirs", "-o", jpg,
-             o.tmdb_image_base .. want.size .. entry.poster_path }, function(res, err)
-        if gen ~= PS.gen then return end
-        local info = utils.file_info(jpg)
-        if not res or res.status ~= 0 or not info or info.size < 1000 then
-            PS.status, PS.err = "error", "poster download failed"
-            render(); return
-        end
-        PS.save_index()   -- the cache folder exists now (curl --create-dirs), so this write can succeed
-        PS.finish_convert(want, gen)
-    end)
-end
-
-function PS.start(want)
-    PS.gen = PS.gen + 1
-    local gen = PS.gen
-    PS.want = want
-    PS.status = "loading"
-    PS.info, PS.err = nil, nil
-    PS.load_index()
-    local ik = PS.norm(want.title) .. "|" .. want.year
-    local hit = PS.idx[ik]
-    if hit ~= nil then
-        if hit == false or hit.none then PS.status = "none"; render(); return end
-        PS.have_poster(want, hit, gen); return
-    end
-    PS.search(want.title, want.year, gen, function(r, err)
-        if gen ~= PS.gen then return end
-        if r == nil then PS.status, PS.err = "error", err; render(); return end
-        if r == false then
-            PS.idx[ik] = { none = true }
-            PS.save_index()
-            PS.status = "none"; render(); return
-        end
-        local entry = {
-            id = tostring(r.id or "0"), name = r.name or r.title or "?", kind = r.media_type,
-            year = (r.first_air_date or r.release_date or ""):sub(1, 4), poster_path = r.poster_path,
-        }
-        PS.idx[ik] = entry
-        PS.save_index()
-        PS.have_poster(want, entry, gen)
-    end)
-end
-
--- Called at the end of every render(). Cheap when nothing changed.
-function PS.update()
-    local rect = layout and layout.poster
-    local title, year
-    if rect and PS.enabled() and not MS.debug then title, year = PS.target() end
-    if not title then
-        if PS.want or PS.shown or PS.status ~= "idle" then PS.hide() end
-        return
-    end
-    -- picture box inside the column: 2:3, leaving room for the caption underneath
-    local pw = rect.x2 - rect.x1 - 16
-    local avail_h = rect.y2 - rect.y1 - 16 - PS.caption_h(rect)
-    local ph = math.floor(pw * 1.5)
-    if ph > avail_h then ph = avail_h; pw = math.floor(ph / 1.5) end
-    if pw < 80 then
-        if PS.want or PS.shown or PS.status ~= "idle" then PS.hide() end
-        return
-    end
-    pw = math.min(pw, 340)
-    ph = math.floor(pw * 1.5)
-    local x = math.floor(rect.x1 + ((rect.x2 - rect.x1) - pw) / 2)
-    local y = math.floor(rect.y1 + 12)
-    local key = PS.norm(title) .. "|" .. year
-    local w_ = PS.want
-    if w_ and w_.key == key and w_.w == pw and w_.h == ph and w_.x == x and w_.y == y then
-        -- same request: make sure the bitmap is still on screen (e.g. after a hide)
-        if w_.ready and PS.shown ~= key and PS.status == "ok" then PS.draw() end
-        return
-    end
-    -- different request: remove the old bitmap right away, debounce the lookup while scrolling
-    if PS.shown then pcall(mp.commandv, "overlay-remove", tostring(PS.ID)); PS.shown = nil end
-    PS.gen = PS.gen + 1
-    local gen = PS.gen
-    local keep_info = (w_ and w_.key == key) and PS.info or nil
-    local want = { key = key, title = title, year = year, w = pw, h = ph, x = x, y = y,
-                   size = (pw > 300) and "w500" or "w342" }
-    PS.want, PS.status, PS.info = want, "loading", keep_info
-    if PS.timer then PS.timer:kill() end
-    PS.timer = mp.add_timeout(0.35, function()
-        PS.timer = nil
-        if gen ~= PS.gen then return end
-        PS.start(want)
-    end)
-end
-
-function PS.caption_h(rect)
-    return 92
-end
-
--- Draw the column background, caption and the required TMDB attribution (ASS layer, under the bitmap).
-function PS.draw_panel(chunks, rect, paint_panel)
-    paint_panel(rect, false)
-    local fs = layout.fs
-    local cx = (rect.x1 + rect.x2) / 2
-    local pw = rect.x2 - rect.x1 - 12
-    local ty = rect.y2 - PS.caption_h(rect) + 4
-    local want = PS.want
-    local status_text
-    if PS.status == "loading" then status_text = "Loading poster..."
-    elseif PS.status == "none" then status_text = "No poster found"
-    elseif PS.status == "error" then status_text = PS.err or "Poster error" end
-    if status_text then
-        table.insert(chunks, D.ev_text(cx, rect.y1 + (rect.y2 - rect.y1 - PS.caption_h(rect)) / 2, 5,
-            string.format("\\fs%d\\c%s", fs - 6, U.ass_color(THEME.text_muted)), U.ass_escape(U.fit_text(status_text, pw, fs - 6))))
-    elseif not want then
-        table.insert(chunks, D.ev_text(cx, rect.y1 + (rect.y2 - rect.y1 - PS.caption_h(rect)) / 2, 5,
-            string.format("\\fs%d\\c%s", fs - 6, U.ass_color(THEME.text_muted)), "No title to look up"))
-    end
-    if PS.info then
-        local line = PS.info.name .. ((PS.info.year and PS.info.year ~= "") and ("  (" .. PS.info.year .. ")") or "")
-        table.insert(chunks, D.ev_text(cx, ty + 8, 5,
-            string.format("\\b1\\fs%d\\c%s", fs - 6, U.ass_color(THEME.text_primary)), U.ass_escape(U.fit_text(line, pw, fs - 6))))
-    end
-    local afs = math.max(10, fs - 14)
-    local lines = { "This product uses the TMDB API", "but is not endorsed or certified", "by TMDB." }
-    for i, ln in ipairs(lines) do
-        table.insert(chunks, D.ev_text(cx, ty + 32 + (i - 1) * (afs + 4), 5,
-            string.format("\\fs%d\\c%s", afs, U.ass_color(THEME.text_muted)), U.ass_escape(U.fit_text(ln, pw, afs))))
-    end
-end
-
--- ============================================================
--- HOME: Netflix-style poster grid (EXPERIMENTAL - poster edition only)
--- Rows of poster cards with the clean title underneath: Continue Watching, Recently Added and
--- All Titles (A-Z). Enter opens a title (its episode page is the normal browser) or resumes a
--- Continue Watching card. Posters are fetched from TMDB lazily (only what is on screen plus the next
--- row), cached on disk, and shown with overlay-add. This product uses the TMDB API but is not
--- endorsed or certified by TMDB.
--- ============================================================
-local HV = {
-    r = 1, c = 1, want_vc = 1, top = 1, rows = {}, sig = nil,
-    items = {}, sn = 0, dn = 0, convq = {}, converting = false, batch_n = 0,
-    shown = {}, hover = nil, vis = {}, hit = {}, vis_cards = {}, wanted = {},
-    last_data = nil, last_click_t = 0, last_click = nil, m = nil, mode = "home",
-}
-local TV = { req = {}, sn = 0, card = nil }     -- title page of one show (episodes with TMDB stills)
-HV.tv = TV
-
-HV.PS1 = [[
-param([string]$Manifest)
-Add-Type -AssemblyName System.Drawing
-$fmt = [System.Drawing.Imaging.PixelFormat]::Format32bppPArgb
-foreach ($line in [System.IO.File]::ReadAllLines($Manifest)) {
-    $p = $line.Split('|')
-    if ($p.Length -lt 4) { continue }
-    try {
-        $W = [int]$p[2]; $H = [int]$p[3]
-        $src = [System.Drawing.Image]::FromFile($p[0])
-        $bmp = New-Object System.Drawing.Bitmap($W, $H, $fmt)
-        $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $g.DrawImage($src, 0, 0, $W, $H)
-        $g.Dispose(); $src.Dispose()
-        $rect = New-Object System.Drawing.Rectangle(0, 0, $W, $H)
-        $data = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, $fmt)
-        $bytes = New-Object byte[] ($data.Stride * $H)
-        [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
-        $bmp.UnlockBits($data); $bmp.Dispose()
-        [System.IO.File]::WriteAllBytes($p[1], $bytes)
-    } catch { }
-}
-]]
-
-local function hv_clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
-
-function HV.active() return browser_active and MS.view == "home" end
--- The hero band is only shown while the first row is at the top; scrolling down gives the rows the full height.
-function HV.rows_y(m) return (m.title and HV.top <= 1) and m.ry1 or m.ry0 end
-function HV.kick() if HV.active() then render() end end
-
--- ---------- geometry ----------
-function HV.metrics()
-    local w, h = U.canvas_size()
-    local pct = tonumber(o.home_card_pct) or 19
-    local title = (HV.mode == "title")
-    local cw = hv_clamp(math.floor(h * pct / 100 + 0.5), 90, 260)
-    local lfs = math.max(12, math.floor(cw * 0.098))
-    if title then
-        cw = hv_clamp(math.floor(h * 0.33), 150, 420)       -- 16:9 episode stills
-        lfs = math.max(12, math.floor(h * 0.0186))
-    end
-    local gap = math.max(10, math.floor(cw * 0.09))
-    local per = math.max(2, math.floor((w - 48 + gap) / (cw + gap)))
-    local used = per * cw + (per - 1) * gap
-    local m = { w = w, h = h, cw = cw, ch = title and math.floor(cw * 9 / 16) or math.floor(cw * 1.5), gap = gap, per = per, lfs = lfs }
-    m.title = title
-    m.mx = math.floor((w - used) / 2)
-    m.top_h = math.max(48, math.floor(lfs * 3.2))
-    m.hero_h = title and math.floor(h * 0.27) or 0
-    m.foot_h = math.max(44, math.floor(lfs * 3.5))
-    m.sec_h = math.floor(lfs * 2.3)
-    m.bar_h = 8
-    m.line_h = math.floor(lfs * 1.3)
-    m.label_h = m.line_h * 2 + math.floor(lfs * 1.2) + 6
-    m.block_h = m.ch + m.bar_h + m.label_h + math.floor(lfs * 1.1)
-    m.ry0, m.ry1 = m.top_h + 6, m.top_h + m.hero_h + 6     -- first row's y without / with the hero band
-    m.sk = m.cw .. "x" .. m.ch
-    return m
-end
-
--- ---------- data ----------
--- Name of the folder whose title should be looked up: the folder itself or the nearest parent with a real title.
-function PS.titled_name(p)
-    for _ = 1, 4 do
-        local pn = p:gsub("/+$", "")
-        if pn == "" or pn == root_href:gsub("/+$", "") then return nil end
-        local t = PS.title_of_name(U.basename(p))
-        if t then return U.basename(p) end
-        p = U.dirname(p)
-    end
-    return nil
-end
-
--- Grouping key: every season of a show shares it ("Show.S01", "Show.S02" -> one card); movies keep their year.
-function HV.gkey(name)
-    local title, year = PS.title_of_name(name)
-    local fp = o.experimental_clean_titles and CT.parse_folder(name) or nil
-    title = title or name
-    if o.merge_seasons and fp and fp.season then return PS.norm(title) end
-    return PS.norm(title) .. "|" .. (year or "")
-end
-
--- Everything the poster lookup and the grouping need to know about a folder name.
-function HV.ident(name)
-    local title, year = PS.title_of_name(name)
-    local fp = o.experimental_clean_titles and CT.parse_folder(name) or nil
-    title = title or name
-    year = year or ""
-    local kp = (fp and fp.season) and "tv" or (year ~= "" and "movie" or "")
-    return { title = title, year = year, fp = fp, kindpref = kp, raw = name,
-             key = PS.norm(title) .. "|" .. year .. "|" .. kp }
-end
-
--- Grouping key: every season of a show shares it ("Show.S01", "Show.S02", "Show Season 1" -> one card); films keep their year.
-function HV.gkey(name)
-    local id = HV.ident(name)
-    if o.merge_seasons and id.fp and id.fp.season then return PS.norm(id.title) end
-    return PS.norm(id.title) .. "|" .. id.year
-end
-
--- One detail part: text, colour, priority (the lowest priority is dropped first when the line is too long).
-local function dp(t, col, prio) return { t = t, c = col, p = prio } end
-
-function HV.chip_parts(chips, prio_base)
-    local out = {}
-    for _, ch in ipairs(chips or {}) do
-        local pr = (ch == "4K" or ch == "1080p" or ch == "720p" or ch == "480p") and 8 or ((ch == "HDR" or ch == "HDR10+" or ch == "DV") and 6 or 5)
-        out[#out + 1] = dp(ch, CT.chip_color(ch), pr)
-    end
-    return out
-end
-
-function HV.card_for_folder(e)
-    local id = HV.ident(e.name)
-    local fp = id.fp
-    local parts = {}
-    if fp then
-        if fp.season then parts[#parts + 1] = dp(fp.season, THEME.text_muted, 9) end
-        for _, p in ipairs(HV.chip_parts(fp.chips)) do parts[#parts + 1] = p end
-        if fp.group then parts[#parts + 1] = dp(fp.group, THEME.text_dim, 7) end
-    end
-    return { kind = "folder", href = e.href, name = e.name, title = id.title, year = id.year, raw = e.name, kindpref = id.kindpref,
-             parts = parts, key = id.key, gkey = HV.gkey(e.name), folders = { e }, mtime = e.mtime or 0 }
-end
-
--- One card per show: folders with the same grouping key are merged (merge_seasons).
-function HV.group_cards(dirs)
-    local groups, order = {}, {}
-    for _, e in ipairs(dirs) do
-        local c = HV.card_for_folder(e)
-        local g = o.merge_seasons and groups[c.gkey] or nil
-        if g then
-            g.folders[#g.folders + 1] = e
-            if (e.mtime or 0) > g.mtime then g.mtime = e.mtime or 0 end
-        else
-            groups[c.gkey] = c
-            order[#order + 1] = c
-        end
-    end
-    for _, c in ipairs(order) do
-        if #c.folders > 1 then
-            table.sort(c.folders, function(a, b) return U.natural_less(a.name, b.name) end)
-            local first, last = c.folders[1], c.folders[#c.folders]
-            local f1 = HV.card_for_folder(first)
-            local fl = HV.card_for_folder(last)
-            c.href, c.name, c.raw = first.href, first.name, first.name
-            c.title, c.year, c.key, c.kindpref = f1.title, f1.year, f1.key, f1.kindpref
-            -- same title in several qualities/groups: say so, the title page lists each one
-            local seasons = {}
-            for _, f in ipairs(c.folders) do
-                local fp = o.experimental_clean_titles and CT.parse_folder(f.name) or nil
-                seasons[(fp and fp.season) or f.name] = true
-            end
-            local nseasons = 0
-            for _ in pairs(seasons) do nseasons = nseasons + 1 end
-            c.parts = {}
-            if nseasons > 1 then c.parts[1] = dp(string.format("%d seasons", nseasons), THEME.text_muted, 9)
-            else c.parts[1] = dp(string.format("%d versions", #c.folders), THEME.text_muted, 9) end
-            for _, p in ipairs(HV.chip_parts(fl.parts and (function() local ch = {} for _, x in ipairs(fl.parts) do if CT.COLORS[x.t] then ch[#ch + 1] = x.t end end return ch end)())) do
-                c.parts[#c.parts + 1] = p
-            end
-        end
-    end
-    -- two different titles that read the same (a 2019 film and a 2024 series): add the year / type to the label
-    local count = {}
-    for _, c in ipairs(order) do local k = PS.norm(c.title); count[k] = (count[k] or 0) + 1 end
-    for _, c in ipairs(order) do
-        if count[PS.norm(c.title)] > 1 then
-            local tag = (c.year ~= "" and c.year) or ((c.kindpref == "tv") and "series" or "movie")
-            if c.kindpref == "tv" and c.year ~= "" then tag = c.year .. " series" end
-            c.shown = c.title .. " (" .. tag .. ")"
-        end
-    end
-    return order
-end
-
-function HV.card_for_resume(e)
-    local dir = e.dirpath or U.dirname(e.href)
-    local tn = PS.titled_name(dir)
-    local id = HV.ident(tn or U.basename(dir))
-    local p = CT.parse(e.name)
-    local hist = watch_history[e.href]
-    local frac, parts = nil, {}
-    if p and p.se then parts[#parts + 1] = dp(p.se, THEME.text_muted, 9) end
-    if e.cw == "next" then
-        parts[#parts + 1] = dp("Next up", THEME.accent, 9)
-    elseif hist and hist.pos and hist.duration and hist.duration > 0 then
-        frac = math.min(1, hist.pos / hist.duration)
-        parts[#parts + 1] = dp(U.fmt_time(math.max(0, hist.duration - hist.pos)) .. " left", THEME.warn, 9)
-    end
-    return { kind = "play", entry = e, href = dir, name = e.name, title = id.title, year = id.year, raw = id.raw, kindpref = id.kindpref,
-             parts = parts, frac = frac, key = id.key, gkey = tn and HV.gkey(tn) or dir }
-end
-
-HV.HOME_SORT = "webdav-browser://home"
-function HV.sort_id()
-    if HV.mode == "title" and TV.card then return "webdav-browser://title/" .. TV.card.key end
-    return HV.HOME_SORT
-end
-function HV.sort_mode()
-    local v = sort_by_dir[HV.sort_id()]
-    if v == "recent" or v == "name" then return v end
-    return (HV.mode == "home" and o.default_sort == "recent") and "recent" or "name"
-end
-function HV.toggle_sort()
-    local nm = (HV.sort_mode() == "recent") and "name" or "recent"
-    sort_by_dir[HV.sort_id()] = nm
-    local sel = HV.selected()
-    HV.reselect = sel and sel.key or nil
-    HV.sig = nil
-    status_line = "Sort: " .. (nm == "recent" and "Recent first" or (HV.mode == "title" and "Episode order" or "Name"))
-    save_persistence()
-    render()
-end
-
--- Show cards for the library search (top-level folders that contain a match).
-function HV.search_cards(groups)
-    local out, seen = {}, {}
-    local rootn = root_href:gsub("/+$", "")
-    local byhref = {}
-    for _, c in ipairs(groups) do for _, f in ipairs(c.folders) do byhref[f.href:gsub("/+$", "")] = c end end
-    for _, r in ipairs(search_results or {}) do
-        local h = (r.is_dir and r.href or r.dirpath or r.href):gsub("/+$", "")
-        -- walk up to the top-level folder under the library root
-        local guard = 0
-        while guard < 12 and h ~= "" and not byhref[h] do
-            local up = U.dirname(h .. "/"):gsub("/+$", "")
-            if up == h then break end
-            h = up
-            guard = guard + 1
-        end
-        local c = byhref[h]
-        if c and not seen[c] then seen[c] = true; out[#out + 1] = c end
-    end
-    return out
-end
-
-function HV.build(m)
-    if HV.mode == "title" then return TV.build(m) end
-    local rows = {}
-    local root = find_cached_dir(root_href)
-    local dirs = {}
-    if root and type(root.entries) == "table" then
-        for _, e in ipairs(root.entries) do if e.is_dir then dirs[#dirs + 1] = e end end
-    end
-    local groups = (#dirs > 0) and HV.group_cards(dirs) or {}
-
-    if HV.q then      -- library search: results are poster cards of the matching shows
-        local cards = HV.search_cards(groups)
-        local q = HV.q
-        local note = (MS.idx_running or not index_meta.last_full) and "  ·  index still building, results may be incomplete" or ""
-        rows[1] = { title = string.format("Search \"%s\"  ·  %d title%s%s", q, #cards, #cards == 1 and "" or "s", note), cards = {}, off = 0 }
-        local i = 1
-        while i <= #cards do
-            local part = {}
-            for j = i, math.min(#cards, i + m.per - 1) do part[#part + 1] = cards[j] end
-            rows[#rows + 1] = { title = (i == 1) and rows[1].title or nil, cards = part, off = 0 }
-            i = i + m.per
-        end
-        if #cards == 0 then HV.search_empty = true else HV.search_empty = false; table.remove(rows, 1) end
-        if #cards == 0 then rows = {} end
-        return rows
-    end
-
-    local bygk = {}
-    for _, c in ipairs(groups) do bygk[c.gkey] = c end
-    if o.continue_row then
-        local cards, seen = {}, {}
-        for _, e in ipairs(get_continue_list() or {}) do
-            local c = HV.card_for_resume(e)
-            local gc = bygk[c.gkey]
-            if gc then c.key, c.title, c.year, c.raw, c.kindpref, c.shown = gc.key, gc.title, gc.year, gc.raw, gc.kindpref, gc.shown end
-            local d = o.merge_seasons and c.gkey or (e.dirpath or "")
-            if not seen[d] then seen[d] = true; cards[#cards + 1] = c end
-        end
-        if #cards > 0 then table.insert(rows, 1, { title = "Continue Watching", cards = cards, shelf = true, off = 0 }) end
-    end
-    if #groups > 0 then
-        local has_mtime = false
-        for _, c in ipairs(groups) do if c.mtime > 0 then has_mtime = true break end end
-        if has_mtime then
-            local rec = {}
-            for i, c in ipairs(groups) do rec[i] = c end
-            table.sort(rec, function(a, b)
-                if a.mtime ~= b.mtime then return a.mtime > b.mtime end
-                return U.natural_less(a.name, b.name)
-            end)
-            local cards = {}
-            for i = 1, math.min(#rec, tonumber(o.home_recent_count) or 20) do cards[i] = rec[i] end
-            rows[#rows + 1] = { title = "Recently Added", cards = cards, shelf = true, off = 0 }
-        end
-        local all = {}
-        for i, c in ipairs(groups) do all[i] = c end
-        local recent = (HV.sort_mode() == "recent")
-        table.sort(all, function(a, b)
-            if recent and a.mtime ~= b.mtime then return a.mtime > b.mtime end
-            return U.natural_less(a.title, b.title)
-        end)
-        local first = true
-        local i = 1
-        while i <= #all do
-            local cards = {}
-            for j = i, math.min(#all, i + m.per - 1) do cards[#cards + 1] = all[j] end
-            rows[#rows + 1] = { title = first and string.format("All Titles  ·  %d  ·  Sort: %s (S)", #all, recent and "Recent" or "Name") or nil, cards = cards, off = 0 }
-            first = false
-            i = i + m.per
-        end
-    end
-    return rows
-end
-
--- ---------- selection ----------
-function HV.clamp()
-    local n = #HV.rows
-    if n == 0 then HV.r, HV.c = 1, 1; return end
-    HV.r = hv_clamp(HV.r, 1, n)
-    HV.c = hv_clamp(HV.c, 1, #HV.rows[HV.r].cards)
-end
-
-function HV.fix_off(m)
-    local row = HV.rows[HV.r]
-    if not row or not row.shelf then return end
-    if HV.c <= row.off then row.off = HV.c - 1
-    elseif HV.c > row.off + m.per then row.off = HV.c - m.per end
-    row.off = hv_clamp(row.off, 0, math.max(0, #row.cards - m.per))
-end
-
-function HV.vcol()
-    local row = HV.rows[HV.r]
-    return HV.c - ((row and row.off) or 0)
-end
-
-function HV.move(dr, dc)
-    local m = HV.metrics()
-    HV.m = m
-    HV.clamp()
-    if #HV.rows == 0 then return end
-    if dc ~= 0 then
-        local row = HV.rows[HV.r]
-        local nc = HV.c + dc
-        if nc < 1 then
-            local prev = HV.rows[HV.r - 1]
-            if not row.shelf and prev and not prev.shelf then HV.r = HV.r - 1; nc = #prev.cards else nc = 1 end
-        elseif nc > #row.cards then
-            local nxt = HV.rows[HV.r + 1]
-            if not row.shelf and nxt and not nxt.shelf then HV.r = HV.r + 1; nc = 1 else nc = #row.cards end
-        end
-        HV.c = nc
-        HV.fix_off(m)
-        HV.want_vc = HV.vcol()
-    end
-    if dr ~= 0 then
-        local nr = hv_clamp(HV.r + dr, 1, #HV.rows)
-        HV.r = nr
-        local row = HV.rows[nr]
-        HV.c = hv_clamp((row.off or 0) + HV.want_vc, 1, #row.cards)
-        HV.fix_off(m)
-    end
-    render()
-end
-
-function HV.edge(first)
-    HV.clamp()
-    if #HV.rows == 0 then return end
-    if first then HV.r, HV.c = 1, 1 else HV.r = #HV.rows; HV.c = #HV.rows[HV.r].cards end
-    HV.fix_off(HV.metrics())
-    HV.want_vc = HV.vcol()
-    render()
-end
-
-function HV.selected()
-    HV.clamp()
-    local row = HV.rows[HV.r]
-    return row and row.cards[HV.c] or nil
-end
-
--- ---------- poster pipeline ----------
-function HV.lookup(w, st)
-    PS.load_index()
-    local ik = w.key
-    local hit = PS.idx[ik]
-    if hit ~= nil then
-        if hit == false or hit.none then st.state = "none" else st.entry, st.state = hit, "entry" end
-        st.tried = type(hit) == "table" and hit.tried or nil
-        return
-    end
-    st.state = "searching"
-    HV.sn = HV.sn + 1
-    local qs = PS.queries(w.raw or w.title, w.title, w.year)
-    st.tried = {}
-    local i, any = 0, nil
-    local function finish(r, q)
-        HV.sn = HV.sn - 1
-        if r == nil then return end
-        if r == false then
-            PS.idx[ik] = { none = true, tried = st.tried }
-            PS.save_index()
-            st.state = "none"
-        else
-            local entry = {
-                id = tostring(r.id or "0"), name = r.name or r.title or "?", kind = r.media_type,
-                year = (r.first_air_date or r.release_date or ""):sub(1, 4), poster_path = r.poster_path,
-                overview = tostring(r.overview or ""):sub(1, 600), backdrop_path = r.backdrop_path or "",
-                vote = tonumber(r.vote_average) or 0, q = q,
-            }
-            PS.idx[ik] = entry
-            st.entry, st.state = entry, "entry"
-        end
-        HV.kick()
-    end
-    local function step()
-        i = i + 1
-        if i > #qs then
-            if any then finish(any, "(closest result)") else finish(false) end
-            return
-        end
-        st.tried[#st.tried + 1] = qs[i]
-        PS.search(qs[i], w.year or "", nil, function(r, err, a)
-            if r == nil then
-                HV.sn = HV.sn - 1
-                st.state, st.err, st.t = "error", err, mp.get_time()
-                HV.kick()
-                return
-            end
-            if r then finish(r, qs[i]) return end
-            any = any or a
-            step()
-        end, w.kindpref, true)
-    end
-    step()
-end
-
-function HV.download(st)
-    local e = st.entry
-    local jpg = string.format("%s/p%s_w342.jpg", PS.dir(), e.id)
-    st.jpg, st.base = jpg, "p" .. e.id
-    local ji = utils.file_info(jpg)
-    if ji and ji.size > 1000 then st.state = "jpg"; return end
-    st.state = "downloading"
-    HV.dn = HV.dn + 1
-    PS.run({ o.curl_path, "-s", "-S", "-m", "30", "--create-dirs", "-o", jpg, o.tmdb_image_base .. "w342" .. e.poster_path },
-        function(res)
-            HV.dn = HV.dn - 1
-            local info = utils.file_info(jpg)
-            if not res or res.status ~= 0 or not info or info.size < 1000 then
-                st.state, st.err, st.t = "error", "poster download failed", mp.get_time()
-            else
-                st.state = "jpg"
-                PS.st_dirty = true
-                PS.save_index()     -- the cache folder exists now
-            end
-            HV.kick()
-        end)
-end
-
-function HV.want_bgra(st, dw, dh)
-    local sk = dw .. "x" .. dh
-    if st.bgra[sk] or st.cq[sk] then return end
-    local bgra = string.format("%s/%s_%s.bgra", PS.dir(), st.base or ("p" .. st.entry.id), sk)
-    local bi = utils.file_info(bgra)
-    if bi and bi.size == dw * dh * 4 then st.bgra[sk] = bgra; return end
-    st.cq[sk] = "queued"
-    HV.convq[#HV.convq + 1] = { st = st, jpg = st.jpg, bgra = bgra, w = dw, h = dh, sk = sk }
-end
-
-function HV.convert_done(batch)
-    for _, it in ipairs(batch) do
-        local bi = utils.file_info(it.bgra)
-        if bi and bi.size == it.w * it.h * 4 then
-            it.st.bgra[it.sk] = it.bgra
-            it.st.cq[it.sk] = "done"
-        else
-            it.st.cq[it.sk] = "fail"
-        end
-    end
-    HV.converting = false
-    PS.st_dirty = true
-    HV.kick()
-end
-
-function HV.convert_pump()
-    if HV.converting or #HV.convq == 0 then return end
-    local batch = {}
-    while #HV.convq > 0 and #batch < 12 do batch[#batch + 1] = table.remove(HV.convq, 1) end
-    HV.converting = true
-    local mode = o.poster_converter
-    if mode == "auto" then mode = (package.config:sub(1, 1) == "\\") and "powershell" or "ffmpeg" end
-    if mode == "powershell" then
-        HV.batch_n = HV.batch_n + 1
-        local manifest = string.format("%s/batch_%d.txt", PS.dir(), HV.batch_n % 4)
-        local lines = {}
-        for _, it in ipairs(batch) do lines[#lines + 1] = string.format("%s|%s|%d|%d", it.jpg, it.bgra, it.w, it.h) end
-        local f = io.open(manifest, "wb")
-        local ps = PS.dir() .. "/convert_batch.ps1"
-        local f2 = io.open(ps, "wb")
-        if not f or not f2 then
-            if f then f:close() end
-            if f2 then f2:close() end
-            HV.convert_done(batch); return
-        end
-        f:write(table.concat(lines, "\n") .. "\n"); f:close()
-        f2:write(HV.PS1); f2:close()
-        PS.run({ "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps, manifest },
-            function() HV.convert_done(batch) end)
-    else
-        local i = 0
-        local function nxt()
-            i = i + 1
-            local it = batch[i]
-            if not it then HV.convert_done(batch); return end
-            if mode == "ffmpeg" then
-                PS.run({ o.ffmpeg_path, "-v", "error", "-y", "-i", it.jpg, "-vf", string.format("scale=%d:%d", it.w, it.h),
-                         "-pix_fmt", "bgra", "-f", "rawvideo", it.bgra }, nxt)
-            else
-                PS.run({ o.magick_path, it.jpg, "-resize", string.format("%dx%d!", it.w, it.h), "-depth", "8", "bgra:" .. it.bgra }, nxt)
-            end
-        end
-        nxt()
-    end
-end
-
-function HV.pump()
-    if not PS.enabled() then return end
-    local m = HV.m
-    local now = mp.get_time()
-    for _, w in ipairs(HV.wanted) do
-        local st = HV.items[w.key]
-        if not st then
-            st = { state = "new", bgra = {}, cq = {} }
-            HV.items[w.key] = st
-        end
-        if st.state == "error" and st.t and now - st.t > 20 then st.state = "new" end
-        if w.still then
-            TV.pump_still(w, st, m)
-        elseif w.kind == "ep" then
-            -- no artwork source for this file (yet): nothing to look up
-        else
-            if st.state == "new" then
-                if HV.sn < 3 then HV.lookup(w, st) end
-            end
-            if st.state == "entry" and HV.dn < 3 then HV.download(st) end
-            if st.state == "jpg" then HV.want_bgra(st, w.dw or m.cw, w.dh or m.ch) end
-        end
-        if w.need then TV.ensure_season(w.need.entry, w.need.s) end
-    end
-    if TV.card and HV.mode == "title" then TV.ensure_details() end
-    HV.convert_pump()
-end
-
--- ---------- bitmaps on screen ----------
-function HV.clear()
-    for id in pairs(HV.shown) do pcall(mp.commandv, "overlay-remove", tostring(id)) end
-    HV.shown = {}
-end
-
-function HV.place()
-    local used = {}
-    if not MS.debug then
-        local sk = HV.m.sk
-        for i, cd in ipairs(HV.vis_cards) do
-            if i > 60 then break end
-            local st = HV.items[cd.card.key]
-            local f = st and st.bgra[sk]
-            if f then
-                local id = i - 1
-                local sig = f .. "@" .. cd.x .. "," .. cd.y
-                if HV.shown[id] ~= sig then
-                    local ok = mp.commandv("overlay-add", tostring(id), tostring(cd.x), tostring(cd.y), f, "0", "bgra",
-                        tostring(HV.m.cw), tostring(HV.m.ch), tostring(HV.m.cw * 4))
-                    HV.shown[id] = ok and sig or nil
-                end
-                used[id] = true
-            end
-        end
-    end
-    -- hero poster (title page)
-    local hero = HV.hero
-    if hero and not MS.debug and HV.mode == "title" then
-        local st = HV.items[hero.key]
-        local f = st and st.bgra[hero.dw .. "x" .. hero.dh]
-        if f then
-            local sig = f .. "@" .. hero.x .. "," .. hero.y
-            if HV.shown[61] ~= sig then
-                local ok = mp.commandv("overlay-add", "61", tostring(hero.x), tostring(hero.y), f, "0", "bgra",
-                    tostring(hero.dw), tostring(hero.dh), tostring(hero.dw * 4))
-                HV.shown[61] = ok and sig or nil
-            end
-            used[61] = true
-        end
-    end
-    for id in pairs(HV.shown) do
-        if not used[id] then
-            pcall(mp.commandv, "overlay-remove", tostring(id))
-            HV.shown[id] = nil
-        end
-    end
-end
-
--- ---------- drawing ----------
-function HV.wrap2(text, maxw, fs)
-    local words = {}
-    for wd in tostring(text):gmatch("%S+") do words[#words + 1] = wd end
-    local function width(s) return U.utf8_len(s) * fs * 0.62 end
-    local l1, i = "", 1
-    while i <= #words do
-        local try = (l1 == "") and words[i] or (l1 .. " " .. words[i])
-        if l1 == "" or width(try) <= maxw then l1 = try; i = i + 1 else break end
-    end
-    local l2 = (i <= #words) and table.concat(words, " ", i) or ""
-    return U.fit_text(l1, maxw, fs), (l2 ~= "" and U.fit_text(l2, maxw, fs) or "")
-end
-
--- Coloured detail line from {t, c, p} parts; the lowest-priority parts are dropped until it fits.
-function HV.detail_ass(parts, maxw, fs, default_col)
-    local list = {}
-    for i, p in ipairs(parts or {}) do list[i] = p end
-    local function width()
-        local n = 0
-        for i, p in ipairs(list) do n = n + U.utf8_len(p.t) + (i > 1 and 3 or 0) end
-        return n * fs * 0.6
-    end
-    while #list > 1 and width() > maxw do
-        local lo, idx = 99, #list
-        for i = #list, 1, -1 do if list[i].p < lo then lo, idx = list[i].p, i end end
-        table.remove(list, idx)
-    end
-    local out = {}
-    for i, p in ipairs(list) do
-        if i > 1 then out[#out + 1] = string.format("{\\c%s} · ", U.ass_color(THEME.text_dim)) end
-        out[#out + 1] = string.format("{\\c%s}%s", U.ass_color(p.c or default_col or THEME.text_muted), U.ass_escape(p.t))
-    end
-    return table.concat(out)
-end
-
--- "S02 · VARYG · 1080p": drop the least important parts until the line fits the card width.
-function HV.fit_parts(parts, full, maxw, fs)
-    parts = parts or {}
-    local order = {}
-    for i, p in ipairs(parts) do order[i] = p end
-    while #order > 1 and U.utf8_len(table.concat(order, " · ")) * fs * 0.62 > maxw do
-        -- chips (2nd entry when 3 parts, resolution) go first, then the group
-        if #order >= 3 then table.remove(order, 2) else table.remove(order) end
-    end
-    return U.fit_text(table.concat(order, " · "), maxw, fs)
-end
-
-function HV.ensure_visible(m)
-    HV.clamp()
-    local guard = 0
-    while guard < 500 do
-        guard = guard + 1
-        HV.top = hv_clamp(HV.top, 1, math.max(1, #HV.rows))
-        if HV.r < HV.top then HV.top = HV.r
-        else
-            local last = HV.top
-            local y = (m.title and HV.top <= 1) and m.ry1 or m.ry0
-            for ri = HV.top, #HV.rows do
-                local need = m.block_h + (HV.rows[ri].title and m.sec_h or 0)
-                if y + need > m.h - m.foot_h and ri > HV.top then break end
-                last = ri
-                y = y + need
-            end
-            if last < HV.r and HV.top < HV.r then HV.top = HV.top + 1 else break end
-        end
-    end
-end
-
-HV.render = function()
-    local m = HV.metrics()
-    HV.m = m
-    local root = find_cached_dir(root_href)
-    local sig = table.concat({ HV.mode, tostring(root and root.entries), tostring(get_continue_list()), m.per, tostring(o.continue_row),
-        tostring(o.merge_seasons), HV.sort_mode(), PS.eps_ver, MS.cache_version, TV.card and TV.card.key or "", m.cw }, "|")
-    if sig ~= HV.sig then
-        HV.sig = sig; HV.rows = HV.build(m); HV.clamp()
-        if HV.reselect then
-            for ri, row in ipairs(HV.rows) do
-                for ci, cd in ipairs(row.cards) do
-                    if cd.key == HV.reselect then HV.r, HV.c = ri, ci; HV.top = math.max(1, ri - 1) end
-                end
-            end
-            HV.reselect = nil
-            HV.fix_off(m); HV.want_vc = HV.vcol()
-        end
-    end
-    overlay.res_x, overlay.res_y = m.w, m.h
-    HV.prune_bgra()
-    HV.fix_off(m)
-    HV.ensure_visible(m)
-    HV.ensure_visible(m)       -- once more: the hero band appears / disappears as the top row changes
-
-    local w, h, lfs = m.w, m.h, m.lfs
-    local chunks = {}
-    local function add(c) chunks[#chunks + 1] = c end
-    add(D.ev_rect(0, 0, w, h, THEME.bg_dim, 100, nil, 0, 0))
-
-    -- top bar
-    add(D.ev_rect(0, 0, w, m.top_h, THEME.bg_header, 100, nil, 0, 0))
-    add(D.ev_rect(0, m.top_h - 2, w, m.top_h, U.pick(o.color_border_grad_top, "909090"), 30, nil, 0, 0))
-    add(D.ev_text(m.mx, m.top_h / 2, 4, string.format("\\b1\\fs%d\\c%s", lfs + 10, U.ass_color(THEME.accent)),
-        (m.title and TV.card) and U.ass_escape(U.fit_text("‹  " .. TV.card.title, w * 0.5, lfs + 10)) or "WebDAV Library"))
-    local any_fail = listing_error[root_href]
-    local right = (any_fail and "error") or (is_loading and "loading…") or "connected"
-    add(D.ev_text(w - 22, m.top_h / 2, 5, string.format("\\b1\\fs%d\\c%s", lfs + 10, U.ass_color(THEME.text_muted)), "×"))
-    add(D.ev_text(w - 50, m.top_h / 2, 6, string.format("\\fs%d\\c%s", lfs, U.ass_color(any_fail and THEME.bad or THEME.text_muted)),
-        U.ass_escape(right)))
-    add(D.ev_text(w - 50 - U.utf8_len(right) * lfs * 0.62 - 18, m.top_h / 2, 6,
-        string.format("\\fs%d\\c%s", lfs + 4, U.ass_color(any_fail and THEME.bad or THEME.good)), "●"))
-    if HV.q and not m.title then
-        local bx1, bx2 = math.floor(w * 0.26), math.floor(w * 0.70)
-        add(D.ev_rect(bx1, m.top_h * 0.16, bx2, m.top_h * 0.84, THEME.bg_panel, 100, THEME.accent, HV.typing and 100 or 35, 1, 8))
-        add(D.ev_text(bx1 + 14, m.top_h / 2, 4, string.format("\\fs%d\\c%s", lfs + 2, U.ass_color(THEME.text_primary)),
-            U.ass_escape(U.fit_text("Search:  " .. HV.q, bx2 - bx1 - 40, lfs + 2)) .. (HV.typing and string.format("{\\c%s}▏", U.ass_color(THEME.accent)) or "")))
-    elseif status_line and status_line ~= "" and status_line ~= "Ready" and not status_line:match("^Loaded") then
-        add(D.ev_text(w / 2, m.top_h / 2, 5, string.format("\\fs%d\\c%s", lfs, U.ass_color(status_line:match("^Failed") and THEME.bad or THEME.text_muted)),
-            U.ass_escape(U.fit_text(status_line, w * 0.4, lfs))))
-    end
-
-    HV.hit, HV.vis_cards, HV.wanted = {}, {}, {}
-    if m.title and TV.card and HV.top <= 1 then
-        local hw, hh = TV.hero_size(m)
-        HV.wanted[1] = { key = TV.card.key, title = TV.card.title, year = TV.card.year, dw = hw, dh = hh }
-    end
-    local vis = {}
-    local y = HV.rows_y(m)
-    for ri = HV.top, #HV.rows do
-        local row = HV.rows[ri]
-        local need = m.block_h + (row.title and m.sec_h or 0)
-        if y + need > h - m.foot_h and #vis > 0 then break end
-        vis[#vis + 1] = { ri = ri, ty = y, y = y + (row.title and m.sec_h or 0) }
-        y = y + need
-    end
-    HV.vis = vis
-
-    HV.hero = nil
-    if m.title and TV.card and HV.top <= 1 then TV.draw_hero(add, m) end
-
-    if #HV.rows == 0 then
-        local msg_ = any_fail and ("⚠  " .. tostring(any_fail) .. "     (press R to retry)") or (is_loading and "Loading library…" or "No folders found")
-        if HV.q then msg_ = (HV.q == "") and "Type to search the library" or ("No titles match \"" .. HV.q .. "\"" .. ((MS.idx_running or not index_meta.last_full) and "   (the library index is still building)" or "")) end
-        add(D.ev_text(w / 2, h / 2, 5, string.format("\\fs%d\\c%s", lfs + 6, U.ass_color(any_fail and THEME.bad or THEME.text_muted)), U.ass_escape(msg_)))
-    end
-
-    for _, v in ipairs(vis) do
-        local row = HV.rows[v.ri]
-        if row.title then
-            add(D.ev_text(m.mx, v.ty + m.sec_h * 0.55, 4, string.format("\\b1\\fs%d\\c%s", lfs + 6, U.ass_color(THEME.text_primary)), U.ass_escape(row.title)))
-        end
-        local off = row.off or 0
-        for i = 1, m.per do
-            local ci = off + i
-            local card = row.cards[ci]
-            if not card then break end
-            local x = m.mx + (i - 1) * (m.cw + m.gap)
-            local py = v.y
-            local sel = (v.ri == HV.r and ci == HV.c)
-            local hov = HV.hover and HV.hover.r == v.ri and HV.hover.c == ci
-            local st = HV.items[card.key]
-            local ready = st and st.bgra[m.sk] and not MS.debug
-            HV.vis_cards[#HV.vis_cards + 1] = { card = card, x = x, y = py }
-            HV.wanted[#HV.wanted + 1] = card
-            HV.hit[#HV.hit + 1] = { x1 = x, y1 = py, x2 = x + m.cw, y2 = py + m.ch + m.bar_h + m.label_h, r = v.ri, c = ci }
-
-            if not ready then
-                add(D.ev_rect(x, py, x + m.cw, py + m.ch, THEME.bg_panel, 100, nil, 0, 0, 6))
-                local ptxt = card.ph or card.shown or card.title
-                local t1, t2 = HV.wrap2(ptxt, m.cw - 16, lfs + 3)
-                add(D.ev_text(x + m.cw / 2, py + m.ch / 2 - (t2 ~= "" and lfs or 0), 5, string.format("\\b1\\fs%d\\c%s", lfs + 3, U.ass_color(THEME.text_muted)), U.ass_escape(t1)))
-                if t2 ~= "" then
-                    add(D.ev_text(x + m.cw / 2, py + m.ch / 2 + lfs * 0.9, 5, string.format("\\b1\\fs%d\\c%s", lfs + 3, U.ass_color(THEME.text_muted)), U.ass_escape(t2)))
-                end
-                if PS.enabled() and st and (st.state == "new" or st.state == "searching" or st.state == "entry" or st.state == "downloading" or st.state == "jpg") and not (st.cq and st.cq[m.sk] == "fail") then
-                    add(D.ev_text(x + m.cw / 2, py + m.ch - lfs * 1.6, 5, string.format("\\fs%d\\c%s", lfs, U.ass_color(THEME.text_dim)), "…"))
-                end
-            end
-            -- ring (outside the picture so the bitmap does not cover it)
-            if sel or hov then
-                add(D.ev_rect(x - 4, py - 4, x + m.cw + 4, py + m.ch + 4, "FFFFFF", 0, sel and THEME.accent or THEME.text_dim, 100, sel and 3 or 2, 8))
-            end
-            -- progress bar (Continue Watching)
-            if card.frac then
-                add(D.ev_rect(x, py + m.ch + 3, x + m.cw, py + m.ch + 3 + 4, THEME.track, 100, nil, 0, 0, 2))
-                add(D.ev_rect(x, py + m.ch + 3, x + math.max(4, m.cw * card.frac), py + m.ch + 3 + 4, THEME.accent, 100, nil, 0, 0, 2))
-            end
-            -- label: clean title (up to 2 lines) + muted detail line
-            local ly = py + m.ch + m.bar_h + 4
-            local t1, t2 = HV.wrap2(card.shown or card.title, m.cw, lfs)
-            local tcol = (sel or hov) and "FFFFFF" or "F2EEFA"      -- bright titles; the ring shows the selection
-            add(D.ev_text(x, ly, 7, string.format("\\b1\\fs%d\\c%s", lfs, U.ass_color(tcol)), U.ass_escape(t1)))
-            if t2 ~= "" then
-                add(D.ev_text(x, ly + m.line_h, 7, string.format("\\b1\\fs%d\\c%s", lfs, U.ass_color(tcol)), U.ass_escape(t2)))
-            end
-            if card.parts and #card.parts > 0 then
-                add(D.ev_text(x, ly + m.line_h * ((t2 ~= "") and 2 or 1) + 2, 7, string.format("\\fs%d\\c%s", lfs - 2, U.ass_color(THEME.text_muted)),
-                    HV.detail_ass(card.parts, m.cw, lfs - 2)))
-            end
-        end
-        -- shelf arrows
-        if row.shelf then
-            local mid = v.y + m.ch / 2
-            if off > 0 then add(D.ev_text(m.mx / 2, mid, 5, string.format("\\b1\\fs%d\\c%s", lfs + 14, U.ass_color(THEME.text_muted)), "‹")) end
-            if off + m.per < #row.cards then add(D.ev_text(w - m.mx / 2, mid, 5, string.format("\\b1\\fs%d\\c%s", lfs + 14, U.ass_color(THEME.text_muted)), "›")) end
-        end
-    end
-    -- extend the wanted list with the next row so it is ready before you scroll to it
-    do
-        local lastv = vis[#vis]
-        local nrow = lastv and HV.rows[lastv.ri + 1]
-        if nrow then
-            for i = 1, m.per do
-                local cd = nrow.cards[(nrow.off or 0) + i]
-                if cd then HV.wanted[#HV.wanted + 1] = cd end
-            end
-        end
-    end
-
-    -- footer
-    add(D.ev_rect(0, h - m.foot_h, w, h, THEME.bg_header, 100, nil, 0, 0))
-    add(D.ev_rect(0, h - m.foot_h, w, h - m.foot_h + 2, U.pick(o.color_border_grad_top, "909090"), 30, nil, 0, 0))
-    local ckey = tostring(o.cache_clear_key or ""):match("[^%s,]+") or ""
-    local hint
-    if HV.q and not m.title then
-        hint = HV.typing and "Type to search   ←↑↓→ Move   Enter Open   Backspace Delete   Esc Clear search"
-            or "←↑↓→ Move   Enter Open   F Edit search   Esc Clear search"
-    elseif m.title then
-        hint = "←↑↓→ Move   Enter Play   A Queue   M Watched   S Sort: " .. (HV.sort_mode() == "recent" and "Recent" or "Order") ..
-            "   V List   T Re-fetch art   " .. ckey:upper() .. " Clear cache   Esc Back"
-    else
-        hint = "←↑↓→ Move   Enter Open / Play   S Sort: " .. (HV.sort_mode() == "recent" and "Recent" or "Name") ..
-            "   O List   F Search all   T Re-fetch art   " .. ckey:upper() .. " Clear cache   R Refresh   Esc Close"
-    end
-    add(D.ev_text(m.mx, h - m.foot_h * 0.68, 4, string.format("\\fs%d\\c%s", lfs - 1, U.ass_color(THEME.text_muted)),
-        U.ass_escape(U.fit_text(hint, w - 2 * m.mx, lfs - 1))))
-    local attr = "This product uses the TMDB API but is not endorsed or certified by TMDB."
-    if o.tmdb_key == "" then attr = "Set tmdb_key in webdav-browser.conf to show posters.  " .. attr end
-    local cs = PS.stats()
-    local ctext = string.format("Cache %s  ·  %d images", U.fmt_bytes(cs.bytes), cs.imgs)
-    local cw_px = U.utf8_len(ctext) * (lfs - 3) * 0.62
-    add(D.ev_text(m.mx, h - m.foot_h * 0.28, 4, string.format("\\fs%d\\c%s", lfs - 3, U.ass_color(THEME.text_dim)),
-        U.ass_escape(U.fit_text(attr, w - 2 * m.mx - cw_px - 30, lfs - 3))))
-    add(D.ev_text(w - m.mx, h - m.foot_h * 0.28, 6, string.format("\\fs%d\\c%s", lfs - 3, U.ass_color(HV.clear_armed and THEME.warn or THEME.text_muted)),
-        U.ass_escape(ctext)))
-
-    -- debug panel (posters are hidden while it is open, because bitmaps draw above all text)
-    if MS.debug then
-        local lines = build_debug_lines()
-        local dfs = math.max(11, lfs - 1)
-        local lh = math.floor(dfs * 1.55)
-        local dw = math.min(math.floor(w * 0.5), 760)
-        local dx2, dy1 = w - 16, m.top_h + 12
-        local dx1, dy2 = dx2 - dw, dy1 + #lines * lh + 16
-        add(D.ev_rect(dx1, dy1, dx2, dy2, THEME.bg_header, 92, THEME.accent, 60, 1, 6))
-        for i, line in ipairs(lines) do
-            add(D.ev_text(dx1 + 12, dy1 + 8 + (i - 0.5) * lh, 4, string.format("\\fs%d\\c%s%s", dfs, U.ass_color(i == 1 and THEME.accent or THEME.text_primary), i == 1 and "\\b1" or ""),
-                U.ass_escape(U.fit_text(line, dw - 24, dfs))))
-        end
-    end
-
-    local data = table.concat(chunks, "\n")
-    if data ~= HV.last_data then
-        HV.last_data = data
-        overlay.data = data
-        overlay:update()
-    end
-    HV.place()
-    HV.pump()
-end
-
--- ============================================================
--- TITLE PAGE  (one show: hero + episode stills grouped by season)
--- ============================================================
-function TV.season_of(name)
-    local fp = o.experimental_clean_titles and CT.parse_folder(name) or nil
-    if fp and fp.season then
-        local n = fp.season:match("^S(%d+)$") or fp.season:match("^S(%d+)E")
-        if n then return tonumber(n) end
-    end
-    local n = name:match("[Ss]eason[%s%._%-]*(%d+)") or name:match("^[Ss](%d%d?)$")
-    return n and tonumber(n) or nil
-end
-
-function TV.se_of(name, hint)
-    local cp = CT.parse(name)
-    local s, e
-    if cp and cp.se then
-        s, e = cp.se:match("^S(%d+)E(%d+)$")
-        if not s then e = cp.se:match("^E(%d+)$") end
-    end
-    if not e then
-        local a, b = name:match("(%d%d?)x(%d%d%d?)")
-        if a then s, e = a, b end
-    end
-    s, e = tonumber(s), tonumber(e)
-    if e and not s then s = hint or 1 end
-    return s or hint, e
-end
-
-function TV.clean_name(name)
-    local cp = CT.parse(name)
-    if cp and cp.title and cp.title ~= "" then return cp.title .. (cp.year and (" (" .. cp.year .. ")") or "") end
-    return (name:gsub("%.[%w]+$", ""):gsub("[%._]+", " "))
-end
-
-function TV.ensure(href)
-    local now = mp.get_time()
-    if TV.req[href] and now - TV.req[href] < 45 then return end
-    TV.req[href] = now
-    fetch_listing(href, { silent = true })
-end
-
-function TV.show_entry()
-    local card = TV.card
-    if not card or not PS.enabled() then return nil end
-    PS.load_index()
-    local e = PS.idx[card.key]
-    if type(e) == "table" and not e.none and e.id then return e end
-    return nil
-end
-
--- All media files of the show (its folders, plus one level of sub-folders such as "Season 1").
-function TV.collect()
-    local card = TV.card
-    local list, loading = {}, 0
-    local function visit(folder, depth, hint, top)
-        top = top or folder
-        local c = find_cached_dir(folder.href)
-        if not c or type(c.entries) ~= "table" then TV.ensure(folder.href); loading = loading + 1; return end
-        if not cache_is_fresh(c) then TV.ensure(folder.href) end     -- show what we have, refresh quietly
-        for _, e in ipairs(c.entries) do
-            if e.is_dir then
-                if depth < 1 then visit(e, depth + 1, TV.season_of(e.name) or hint, top) end
-            elseif U.is_media(e.name) then
-                local s, n = TV.se_of(e.name, hint)
-                list[#list + 1] = { entry = e, s = s, e = n, folder = folder, top = top }
-            end
-        end
-    end
-    for _, f in ipairs(card.folders or {}) do visit(f, 0, TV.season_of(f.name)) end
-    return list, loading
-end
-
-local function tv_natural(a, b)
-    local as, bs = a.s or 0, b.s or 0
-    if as ~= bs then return as < bs end
-    if a.e and b.e and a.e ~= b.e then return a.e < b.e end
-    if (a.e ~= nil) ~= (b.e ~= nil) then return a.e ~= nil end
-    return U.natural_less(a.entry.name, b.entry.name)
-end
-
--- Episode info for file (s, e): TMDB's own season first; when TMDB has no such season (or it is shorter), the file's running
--- number is mapped onto TMDB's seasons instead (shows TMDB numbers continuously, absolute-numbered anime...).
--- returns info|nil, season used, episode used, needs-a-season-fetch
-function TV.info_for(show, ep, offs)
-    if not (show and show.kind ~= "movie" and ep.e) then return nil end
-    PS.load_eps()
-    local s = ep.s or 1
-    local sc = type(show.sc) == "table" and show.sc or nil
-    local direct = true
-    if sc then
-        local cnt = tonumber(sc[tostring(s)])
-        if not cnt or ep.e > cnt then direct = false end
-    end
-    if direct then
-        local rec = PS.eps[show.id .. ":" .. s]
-        if rec == nil then return nil, s, ep.e, true end
-        local info = PS.ep_info(show, s, ep.e)
-        if info then return info, s, ep.e end
-        if not sc then return nil, s, ep.e end
-    end
-    if sc then
-        local keys = {}
-        for k in pairs(sc) do if tonumber(k) and tonumber(k) > 0 then keys[#keys + 1] = tonumber(k) end end
-        table.sort(keys)
-        local n = (offs[ep.s or 0] or 0) + ep.e
-        for _, k in ipairs(keys) do
-            local c = tonumber(sc[tostring(k)]) or 0
-            if n <= c then
-                local rec = PS.eps[show.id .. ":" .. k]
-                if rec == nil then return nil, k, n, true end
-                return PS.ep_info(show, k, n), k, n
-            end
-            n = n - c
-        end
-    end
-    return nil, s, ep.e
-end
-
-function TV.build(m)
-    local card = TV.card
-    if not card then return {} end
-    local eps, loading = TV.collect()
-    TV.loading = loading
-    table.sort(eps, tv_natural)
-    TV.ordered = eps
-    local show = TV.show_entry()
-    local recent = (HV.sort_mode() == "recent")
-
-    local seasons, order = {}, {}
-    for _, ep in ipairs(eps) do
-        local k = ep.s or 0
-        if not seasons[k] then seasons[k] = {}; order[#order + 1] = k end
-        table.insert(seasons[k], ep)
-    end
-    table.sort(order)
-
-    -- how many episodes each local season holds, to map running numbers onto TMDB's seasons
-    local counts, offs, run = {}, {}, 0
-    for _, ep in ipairs(eps) do local k = ep.s or 0; counts[k] = math.max(counts[k] or 0, ep.e or 0, 1) end
-    for _, k in ipairs(order) do offs[k] = run; run = run + counts[k] end
-    local allmovie = true
-    for _, ep in ipairs(eps) do if ep.e then allmovie = false break end end
-
-    local function make_card(ep)
-        local e = ep.entry
-        local info, ts, te, need = TV.info_for(show, ep, offs)
-        local nm = info and info.n ~= "" and info.n or nil
-        local c = { kind = "ep", ep = ep, entry = e, name = e.name, year = "" }
-        if ep.e then
-            c.title = ep.e .. ". " .. (nm or ("Episode " .. ep.e))
-            c.ph = "Episode " .. ep.e
-        else
-            c.title = (#eps == 1 or allmovie) and (card.shown or card.title) or TV.clean_name(e.name)
-        end
-        local parts = {}
-        local hist = watch_history[e.href]
-        if watched_set[e.href] then
-            c.watched = true
-            parts[#parts + 1] = dp("✓ Watched", THEME.good, 10)
-        elseif hist and hist.pos and hist.duration and hist.duration > 0 then
-            c.frac = math.min(1, hist.pos / hist.duration)
-            parts[#parts + 1] = dp(U.fmt_time(math.max(0, hist.duration - hist.pos)) .. " left", THEME.warn, 10)
-        end
-        local cp = CT.parse(e.name)
-        local ffp = o.experimental_clean_titles and CT.parse_folder((ep.top or ep.folder).name) or nil
-        local chips = (cp and cp.chips and #cp.chips > 0) and cp.chips or (ffp and ffp.chips) or {}
-        for _, p in ipairs(HV.chip_parts(chips)) do parts[#parts + 1] = p end
-        if ffp and ffp.group then parts[#parts + 1] = dp(ffp.group, THEME.text_dim, 7) end
-        if info and info.v and info.v > 0 then parts[#parts + 1] = dp(string.format("★ %.1f", info.v), THEME.warn, 4) end
-        if e.size and e.size > 0 then parts[#parts + 1] = dp(U.fmt_bytes(e.size), THEME.text_muted, 3) end
-        if info and info.r and info.r > 0 then parts[#parts + 1] = dp(info.r .. " min", THEME.text_muted, 2) end
-        c.parts = parts
-        if info and info.st and info.st ~= "" then
-            c.key = string.format("still:%s:%d:%d", show.id, ts, te)
-            c.still = { size = "w300", path = info.st, base = string.format("s%s_%d_%d", show.id, ts, te) }
-        elseif show and not ep.e and show.backdrop_path and show.backdrop_path ~= "" then
-            c.key = "bd:" .. show.id
-            c.still = { size = "w300", path = show.backdrop_path, base = "b" .. show.id }
-        else
-            c.key = "file:" .. e.href
-            if need then c.need = { entry = show, s = ts } end
-        end
-        if ep.e and show then
-            c.dbg = string.format("S%sE%s -> TMDB S%sE%s%s", tostring(ep.s), tostring(ep.e), tostring(ts), tostring(te),
-                info and (info.st ~= "" and " (still)" or " (no still on TMDB)") or (need and " (fetching)" or " (no data)"))
-        end
-        c.href = card.href
-        return c
-    end
-
-    local rows = {}
-    for _, k in ipairs(order) do
-        local list = seasons[k]
-        if recent then
-            table.sort(list, function(a, b)
-                local am, bm = a.entry.mtime or 0, b.entry.mtime or 0
-                if am ~= bm then return am > bm end
-                return tv_natural(a, b)
-            end)
-        end
-        local title
-        if k > 0 then title = string.format("Season %d  ·  %d episode%s", k, #list, #list == 1 and "" or "s")
-        elseif #order == 1 and #list == 1 then title = nil
-        else title = string.format("Files  ·  %d", #list) end
-        local first = true
-        local i = 1
-        while i <= #list do
-            local cards = {}
-            for j = i, math.min(#list, i + m.per - 1) do cards[#cards + 1] = make_card(list[j]) end
-            rows[#rows + 1] = { title = first and title or nil, cards = cards, off = 0 }
-            first = false
-            i = i + m.per
-        end
-    end
-    TV.count, TV.seasons, TV.allmovie = #eps, #order, allmovie
-    return rows
-end
-
--- Converted bitmaps (.bgra) are re-creatable and one set exists per window size; keep only the sizes in use now
--- so resizing the window over months cannot pile up hundreds of MB. Downloaded images and TMDB data are never pruned.
-function HV.prune_bgra()
-    if HV.pruned or not PS.enabled() then return end
-    HV.pruned = true
-    local keep = {}
-    local saved = HV.mode
-    for _, md in ipairs({ "home", "title" }) do
-        HV.mode = md
-        local m = HV.metrics()
-        keep[m.cw .. "x" .. m.ch] = true
-        if md == "title" then local hw, hh = TV.hero_size(m); keep[hw .. "x" .. hh] = true end
-    end
-    HV.mode = saved
-    local dir = PS.dir()
-    local list = utils.readdir(dir, "files")
-    if type(list) ~= "table" then return end
-    for _, f in ipairs(list) do
-        local dims = f:match("_(%d+x%d+)%.bgra$")
-        if dims and not keep[dims] then pcall(os.remove, dir .. "/" .. f) end
-    end
-    PS.st_dirty = true
-end
-
--- ---- background work for the page ----
-function TV.ensure_season(show, s)
-    if not (show and show.id and s) then return end
-    PS.load_eps()
-    local key = show.id .. ":" .. s
-    if PS.eps[key] ~= nil or TV.season_busy and TV.season_busy[key] then return end
-    if TV.sn >= 2 then return end
-    TV.season_busy = TV.season_busy or {}
-    TV.season_busy[key] = true
-    TV.sn = TV.sn + 1
-    PS.season(show, s, function(err)
-        TV.sn = TV.sn - 1
-        if err then   -- network trouble: allow a retry after a while, nothing is stored
-            mp.add_timeout(30, function() TV.season_busy[key] = nil end)
-        else
-            TV.season_busy[key] = nil
-        end
-        HV.kick()
-    end)
-end
-
-function TV.ensure_details()
-    local e = TV.show_entry()
-    if not e or e.detail then return end
-    if TV.det_busy == e.id then return end
-    TV.det_busy = e.id
-    PS.details(e, function() HV.kick() end)
-end
-
-function TV.pump_still(w, st, m)
-    if st.state == "new" then
-        if HV.dn >= 3 then return end
-        local sp = w.still
-        st.base = sp.base
-        st.jpg = string.format("%s/%s_%s.jpg", PS.dir(), sp.base, sp.size)
-        st.state = "downloading"
-        HV.dn = HV.dn + 1
-        PS.fetch_image(sp.size, sp.path, st.jpg, function(ok)
-            HV.dn = HV.dn - 1
-            if ok then st.state = "jpg"; PS.st_dirty = true
-            else st.state, st.t, st.err = "error", mp.get_time(), "still download failed" end
-            HV.kick()
-        end)
-    elseif st.state == "jpg" then
-        HV.want_bgra(st, m.cw, m.ch)
-    end
-end
-
--- ---- hero (poster + title + overview) ----
-function TV.hero_size(m)
-    local hh = m.hero_h - 20
-    return math.floor(hh * 2 / 3), hh
-end
-
-function TV.wrap(text, maxw, fs, maxlines)
-    local words = {}
-    for wd in tostring(text):gmatch("%S+") do words[#words + 1] = wd end
-    local lines, cur = {}, ""
-    local i = 1
-    while i <= #words do
-        local try = (cur == "") and words[i] or (cur .. " " .. words[i])
-        if cur == "" or U.utf8_len(try) * fs * 0.55 <= maxw then cur = try; i = i + 1
-        else
-            lines[#lines + 1] = cur; cur = ""
-            if #lines >= maxlines then break end
-        end
-    end
-    if cur ~= "" and #lines < maxlines then lines[#lines + 1] = cur
-    elseif i <= #words and #lines >= maxlines then lines[#lines] = U.fit_text(lines[#lines] .. " " .. table.concat(words, " ", i), maxw, fs) end
-    return lines
-end
-
-function TV.draw_hero(add, m)
-    local card, lfs, w = TV.card, m.lfs, m.w
-    local hw, hh = TV.hero_size(m)
-    local x0, y0 = m.mx, m.top_h + 10
-    local st = HV.items[card.key]
-    local ready = st and st.bgra[hw .. "x" .. hh] and not MS.debug
-    HV.hero = { key = card.key, x = x0, y = y0, dw = hw, dh = hh }
-    if not ready then
-        add(D.ev_rect(x0, y0, x0 + hw, y0 + hh, THEME.bg_panel, 100, nil, 0, 0, 6))
-        add(D.ev_text(x0 + hw / 2, y0 + hh / 2, 5, string.format("\\fs%d\\c%s", lfs, U.ass_color(THEME.text_dim)), PS.enabled() and "…" or ""))
-    end
-    local show = TV.show_entry()
-    local tx = x0 + hw + 26
-    local maxw = w - tx - m.mx
-    add(D.ev_text(tx, y0 + lfs * 1.1, 4, string.format("\\b1\\fs%d\\c%s", lfs + 14, "FFFFFF"), U.ass_escape(U.fit_text(card.shown or card.title, maxw, lfs + 14))))
-    local meta = {}
-    local year
-    if not cut then
-        local init2 = 1
-        while true do
-            local a, _, y = lower:find("[%._%s%(%[](%d%d%d%d)[%._%s%)%]]", init2)
-            if not a then break end
-            if y:sub(1, 2) == "19" or y:sub(1, 2) == "20" then year = y; cut = a - 1; break end
-            init2 = a + 1
-        end
-    end
-    if not cut then
-        local best
-        for _, tok in ipairs(CT.TOKENS) do
-            local a = lower:find("[%._%s%-%[%(]" .. tok)
-            if a and (not best or a < best) then best = a end
-        end
-        if best then cut = best - 1 end
-    end
-    if not cut and not se_label then return false end
-
-    local title = base:sub(1, cut or #base)
-    title = title:gsub("^%b[]%s*", "")
-    title = title:gsub("[%._]+", " "):gsub("%s+", " "):gsub("^[%s%-]+", ""):gsub("[%s%-%(%[]+$", "")
-    if title == "" and not se_label then return false end
-
-    local chips = {}
-    local function has(pat) return lower:find(pat) ~= nil end
-    if has("2160p") or has("%f[%w]4k%f[%W]") or has("%f[%a]uhd%f[%A]") then chips[#chips + 1] = "4K"
-    elseif has("1080[pi]") then chips[#chips + 1] = "1080p"
-    elseif has("720p") then chips[#chips + 1] = "720p"
-    elseif has("480p") then chips[#chips + 1] = "480p" end
-    if has("hdr10%+") or has("hdr10plus") then chips[#chips + 1] = "HDR10+"
-    elseif has("%f[%a]hdr%f[%A]") then chips[#chips + 1] = "HDR" end
-    if has("%f[%a]dv%f[%A]") or has("dovi") or has("dolby[%._%s%-]?vision") then chips[#chips + 1] = "DV" end
-    if has("atmos") then chips[#chips + 1] = "ATMOS" end
-    if has("remux") then chips[#chips + 1] = "REMUX" end
-    if has("dual[%._%s%-]?audio") then chips[#chips + 1] = "DUAL" end
-
-    return {
-        title = title, se = se_label, year = year, chips = chips,
-        label = se_label or (title .. (year and (" (" .. year .. ")") or "")),
-    }
-end
-
-function CT.parse(name)
-    local hit = CT.cache[name]
-    if hit ~= nil then return hit end
-    local ok, res = pcall(CT.parse_raw, name)
-    if not ok then res = false end
-    CT.count = CT.count + 1
-    if CT.count > 6000 then CT.cache, CT.count = {}, 1 end
-    CT.cache[name] = res
-    return res
-end
-
--- true when every parsed media file in the list shares one show title (then the title is redundant
--- on each row and only "S01E03" is shown)
-function CT.uniform_title(items)
-    local first, seen = nil, 0
-    for _, it in ipairs(items) do
-        if not it.is_dir and U.is_media(it.name) then
-            local cp = CT.parse(it.name)
-            if cp then
-                local tl = cp.title:lower()
-                if first == nil then first = tl elseif first ~= tl then return false end
-                seen = seen + 1
-                if seen >= 60 then break end
-            end
-        end
-    end
-    return true
-end
-
--- ---- folder names: "MASHLE.MAGIC.AND.MUSCLES.S01.1080p.BluRay.REMUX.AVC.FLAC.2.0-NAN0" ----
---   -> title "Mashle Magic and Muscles", season "S01", chips {1080p, REMUX}, group "NAN0"
-CT.GROUP_BLOCK = { dl = true, hd = true, rip = true, ma = true, hdr = true, dv = true, webdl = true, hevc = true,
-    x264 = true, x265 = true, h264 = true, h265 = true, avc = true, aac = true, dts = true, ac3 = true, flac = true }
-CT.SMALL_WORDS = { a = true, an = true, ["and"] = true, as = true, at = true, but = true, by = true, ["for"] = true,
-    ["in"] = true, of = true, on = true, ["or"] = true, the = true, to = true, vs = true }
-
--- Only names that are ALL upper or ALL lower case get re-cased; mixed case is how the release was named.
-function CT.titlecase(str)
-    if str:find("%l") and str:find("%u") then return str end
-    local out, first = {}, true
-    for w in str:gmatch("%S+") do
-        local lw = w:lower()
-        if not first and CT.SMALL_WORDS[lw] then out[#out + 1] = lw
-        else out[#out + 1] = lw:sub(1, 1):upper() .. lw:sub(2) end
-        first = false
-    end
-    return table.concat(out, " ")
-end
-
-function CT.chips_for(lower)
-    local chips = {}
-    local function has(pat) return lower:find(pat) ~= nil end
-    if has("2160p") or has("%f[%w]4k%f[%W]") or has("%f[%a]uhd%f[%A]") then chips[#chips + 1] = "4K"
-    elseif has("1080[pi]") then chips[#chips + 1] = "1080p"
-    elseif has("720p") then chips[#chips + 1] = "720p"
-    elseif has("480p") then chips[#chips + 1] = "480p" end
-    if has("hdr10%+") or has("hdr10plus") then chips[#chips + 1] = "HDR10+"
-    elseif has("%f[%a]hdr%f[%A]") then chips[#chips + 1] = "HDR" end
-    if has("%f[%a]dv%f[%A]") or has("dovi") or has("dolby[%._%s%-]?vision") then chips[#chips + 1] = "DV" end
-    if has("atmos") then chips[#chips + 1] = "ATMOS" end
-    if has("remux") then chips[#chips + 1] = "REMUX" end
-    if has("dual[%._%s%-]?audio") then chips[#chips + 1] = "DUAL" end
-    return chips
-end
-
-function CT.parse_folder_raw(name)
-    local base = name
-    local group
-    local lead = base:match("^%[([^%]]+)%]")                 -- anime style: "[SubsPlease] Show ..."
-    if lead and #lead >= 2 and #lead <= 24 then group = lead end
-    local body = base:gsub("^%b[]%s*", "")
-    body = body:gsub("%s*%b[]%s*$", "")                       -- trailing [site]/[hash] tags
-    local g = body:match("%-([%w_]+)$")                       -- scene style: "...-GROUP"
-    if g and not group and #g >= 2 and #g <= 20 and not CT.GROUP_BLOCK[g:lower()] and not g:match("^%d+$") then
-        group = g
-        body = body:sub(1, #body - #g - 1)
-    end
-
-    local lower = body:lower()
-    local ls = lower .. "."
-    local cut, season, year
-    local function mark(a) if a and (not cut or a < cut) then cut = a end end
-
-    local a, _, s1, s2 = ls:find("[%._%s%(%[%-]s(%d%d?)%-s?(%d%d?)[%._%s%)%]%-]")
-    if a then season = string.format("S%02d-S%02d", tonumber(s1), tonumber(s2)); mark(a) end
-    if not season then
-        local b, _, sn, ep = ls:find("[%._%s%(%[%-]s(%d%d?)e(%d%d%d?)[%._%s%)%]%-]")
-        if b then season = string.format("S%02dE%02d", tonumber(sn), tonumber(ep)); mark(b) end
-    end
-    if not season then
-        local b, _, sn = ls:find("[%._%s%(%[%-]s(%d%d?)[%._%s%)%]%-]")
-        if b then season = string.format("S%02d", tonumber(sn)); mark(b) end
-    end
-    if not season then
-        local b, _, sn = ls:find("[%._%s%(%[%-]season[%._%s]*(%d%d?)[%._%s%)%]%-]")
-        if b then season = string.format("S%02d", tonumber(sn)); mark(b) end
-    end
-    local ca = ls:find("[%._%s%(%[%-]complete[%._%s%)%]%-]")
-    if ca then
-        mark(ca)
-        if not season then season = "Complete" end
-    end
-    local init = 1
-    while true do
-        local b, _, y = ls:find("[%._%s%(%[](%d%d%d%d)[%._%s%)%]]", init)
-        if not b then break end
-        if y:sub(1, 2) == "19" or y:sub(1, 2) == "20" then year = y; mark(b); break end
-        init = b + 1
-    end
-    for _, tok in ipairs(CT.TOKENS) do
-        mark(ls:find("[%._%s%-%[%(]" .. tok))
-    end
-
-    if not cut and not group then return false end
-    local title = body:sub(1, (cut or (#body + 1)) - 1)
-    title = title:gsub("[%._]+", " "):gsub("%s+", " ")
-    title = title:gsub("^[%s%-]+", ""):gsub("[%s%-%(%[]+$", "")
-    local anime_ep = title:match("%s%-%s(%d%d?%d?)$")         -- anime "Show - 12"
-    if anime_ep then
-        title = title:gsub("%s%-%s%d%d?%d?$", "")
-        if not season then season = string.format("E%02d", tonumber(anime_ep)) end
-    end
-    if title == "" then return false end
-
-    return {
-        title = CT.titlecase(title), season = season, year = year, group = group,
-        chips = CT.chips_for(lower),
-    }
-end
-
-CT.fcache, CT.fcount = {}, 0
-function CT.parse_folder(name)
-    local hit = CT.fcache[name]
-    if hit ~= nil then return hit end
-    local ok, res = pcall(CT.parse_folder_raw, name)
-    if not ok then res = false end
-    CT.fcount = CT.fcount + 1
-    if CT.fcount > 3000 then CT.fcache, CT.fcount = {}, 1 end
-    CT.fcache[name] = res
-    return res
-end
-
-CT.COLORS = {
-    ["4K"] = "accent", ["1080p"] = "muted", ["720p"] = "muted", ["480p"] = "muted",
-    ["HDR"] = "warn", ["HDR10+"] = "warn", ["DV"] = "audio", ["ATMOS"] = "video",
-    ["REMUX"] = "good", ["DUAL"] = "folder", ["NEXT"] = "accent",
-}
-function CT.chip_color(label)
-    local k = CT.COLORS[label]
-    if k == "accent" then return THEME.accent elseif k == "muted" then return THEME.text_muted
-    elseif k == "warn" then return THEME.warn elseif k == "audio" then return THEME.audio
-    elseif k == "video" then return THEME.video elseif k == "good" then return THEME.good
-    elseif k == "folder" then return THEME.folder end
-    return THEME.warn   -- resume-time chips
-end
-
--- ============================================================
--- ROW DRAWING (continued)
--- ============================================================
-local function draw_sidebar_rows(chunks, hitboxes, rect)
-    local header_h = layout.panel_header_h
-    local row_h = layout.row_h
-    local fs = layout.fs
-    local items = get_panel_items("sidebar")
-    local selected_idx = sidebar_selected_index
-    local scroll_off = scroll_offset_folders
-    local vis = visible_rows_for(rect, header_h, row_h)
-    local focused = (focus_panel == "sidebar")
-    local tree_mode = not (search_scope == "sidebar" and search_query ~= "")
-
-    local body_x1, body_y1 = rect.x1 + 1, rect.y1 + header_h
-    local body_x2, body_y2 = rect.x2 - 1, rect.y2 - 1
-    local clip = D.clip_tag(body_x1, body_y1, body_x2, body_y2)
-
-    local last_idx = math.min(#items, scroll_off + vis)
-    for i = scroll_off + 1, last_idx do
-        local node = items[i]
-        local row_y1 = body_y1 + (i - scroll_off - 1) * row_h
-        local row_y2 = math.min(row_y1 + row_h, body_y2)
-        local is_sel = focused and (i == selected_idx)
-        local is_hov = (hover_panel == "sidebar" and hover_index == i and not is_sel)
-
-        if is_sel then
-            table.insert(chunks, D.ev_rect(rect.x1 + 2, row_y1 + 1, rect.x2 - 2, row_y2 - 1, THEME.accent, 18, nil, 0, 0, o.corner_radius_row))
-            table.insert(chunks, D.ev_rect(rect.x1 + 2, row_y1 + 1, rect.x1 + 5, row_y2 - 1, THEME.accent, 100, nil, 0, 0, o.corner_radius_small))
-        elseif is_hov then
-            table.insert(chunks, D.ev_rect(rect.x1 + 2, row_y1 + 1, rect.x2 - 2, row_y2 - 1, "FFFFFF", 7, nil, 0, 0, o.corner_radius_row))
-        end
-
-        local icon, icon_col
-        if node.virtual then
-            icon, icon_col = "★", THEME.warn
-        elseif node.loading then
-            icon, icon_col = spinner_frames[spinner_idx], THEME.text_muted
-        elseif node.loaded and #node.children == 0 then
-            icon, icon_col = ICONS.folder_empty, THEME.text_dim
-        elseif node.expanded then
-            icon, icon_col = ICONS.folder_open, THEME.folder
-        else
-            icon, icon_col = ICONS.folder_closed, THEME.folder
-        end
-
-        local indent = tree_mode and (math.min(node.depth, o.max_indent_levels) * o.indent_px) or 0
-        local arrow_x = rect.x1 + 14 + indent
-        local name_x = arrow_x + (tree_mode and 18 or 0)
-        local name_y = row_y1 + row_h / 2
-
-        -- expand/collapse arrow: its own click target (toggles WITHOUT opening the folder)
-        if tree_mode and not node.virtual and not (node.loaded and #node.children == 0) then
-            table.insert(chunks, D.ev_text(arrow_x + 6, name_y, 5,
-                string.format("%s\\fs%d\\c%s", clip, fs - 4, U.ass_color(is_sel and THEME.accent or THEME.text_muted)),
-                node.expanded and "▾" or "▸"))
-            table.insert(hitboxes, {
-                panel = "sidebar", index = i, arrow = true,
-                x1 = arrow_x - 6, y1 = row_y1, x2 = arrow_x + 20, y2 = row_y2,
-            })
-        end
-
-        local name_col
-        if is_sel then
-            name_col = THEME.accent
-        elseif node.virtual then
-            name_col = THEME.warn
-        elseif focused then
-            name_col = THEME.text_primary
-        else
-            name_col = THEME.text_muted
-        end
-
-        local active_marker = ""
-        if node.href == current_path then
-            active_marker = string.format("{\\c%s}%s ", U.ass_color(THEME.accent), ICONS.active_marker)
-        end
-
-        local max_name_px = math.max(20, rect.x2 - name_x - 40)
-        local display_name = U.fit_text(node.name, max_name_px, fs)
-        local suffix = node.virtual and "" or "/"
-        local count_txt = ""
-        if node.virtual then
-            count_txt = string.format("  {\\c%s}%d", U.ass_color(THEME.text_dim), #get_continue_list())
-        end
-
-        -- cleaned folder name: Title  S01  1080p REMUX  GROUP   (extras are dropped, last first, if the row is narrow)
-        local fp = (o.experimental_clean_titles and o.clean_folder_titles and not node.virtual) and CT.parse_folder(node.name) or nil
-        if fp then
-            local budget = max_name_px - 30 - (node.href == current_path and 16 or 0)
-            local title_min = math.min(U.utf8_len(fp.title) * fs * 0.62, fs * 0.62 * 14)
-            local used, extras = 0, {}
-            local function add_extra(text, size, col)
-                local w = (U.utf8_len(text) + 2) * size * 0.58
-                if budget - used - w >= title_min then
-                    used = used + w
-                    extras[#extras + 1] = string.format("  {\\fs%d\\c%s}%s", size, U.ass_color(col), U.ass_escape(text))
-                end
-            end
-            if fp.season then add_extra(fp.season, fs - 4, THEME.text_muted) end
-            if fp.group then add_extra(fp.group, fs - 6, THEME.audio) end
-            if o.clean_titles_chips then
-                local chip_txt = {}
-                for _, c in ipairs(fp.chips) do chip_txt[#chip_txt + 1] = c end
-                for k = 1, math.min(#chip_txt, 3) do add_extra(chip_txt[k], fs - 8, CT.chip_color(chip_txt[k])) end
-            end
-            display_name = U.fit_text(fp.title, budget - used, fs)
-            suffix = table.concat(extras)
-        end
-
-        local line = string.format("%s{\\c%s}%s  {\\c%s}%s%s%s",
-            active_marker, U.ass_color(icon_col), icon, U.ass_color(name_col), U.ass_escape(display_name), suffix, count_txt)
-
-        table.insert(chunks, D.ev_text(name_x, name_y, 4, string.format("%s\\fs%d", clip, fs), line))
-
-        table.insert(hitboxes, {
-            panel = "sidebar", index = i,
-            x1 = rect.x1, y1 = row_y1, x2 = rect.x2, y2 = row_y2,
-        })
-    end
-
-    if #items == 0 then
-        local msg2 = (search_scope == "sidebar" and search_query ~= "") and "(no matches)" or "(no subfolders)"
-        table.insert(chunks, D.ev_text(rect.x1 + 14, rect.y1 + header_h + 22, 4,
-            string.format("\\i1\\fs%d\\c%s", fs - 4, U.ass_color(THEME.text_dim)), msg2))
-    end
-
-    draw_scrollbar(chunks, rect, header_h, scroll_off, #items, vis, "sidebar")
-    if last_idx < #items then
-        table.insert(chunks, D.ev_text((rect.x1 + rect.x2) / 2, rect.y2 - 10, 5,
-            string.format("\\fs%d\\c%s", fs - 8, U.ass_color(THEME.accent)), "▼"))
-    end
-end
-
-local function draw_episode_rows(chunks, hitboxes, rect)
-    local header_h = layout.panel_header_h
-    local row_h = layout.row_h
-    local fs = layout.fs
-    local items = get_panel_items("episodes")
-    local selected_idx = selected_episode
-    local scroll_off = scroll_offset_episodes
-    local vis = visible_rows_for(rect, header_h, row_h)
-    local focused = (focus_panel == "episodes")
-    local is_global = (search_scope == "global")
-
-    local body_x1, body_y1 = rect.x1 + 1, rect.y1 + header_h
-    local body_x2, body_y2 = rect.x2 - 1, rect.y2 - 1
-    local clip = D.clip_tag(body_x1, body_y1, body_x2, body_y2)
-
-    local clean = o.experimental_clean_titles and not is_global
-    local uniform = clean and CT.uniform_title(items)
-    local cfs = math.max(10, fs - 8)
-
-    -- draws one chip with its LEFT edge at x_left; returns the next chip's left edge
-    local function draw_chip(x_left, cy, label, color)
-        local w = U.utf8_len(label) * cfs * 0.62 + 12
-        local x2 = x_left + w
-        table.insert(chunks, D.ev_rect(x_left, cy - cfs * 0.78, x2, cy + cfs * 0.78, color, 16, color, 45, 1, o.corner_radius_small))
-        table.insert(chunks, D.ev_text((x_left + x2) / 2, cy, 5,
-            string.format("%s\\b1\\fs%d\\c%s", clip, cfs, U.ass_color(color)), U.ass_escape(label)))
-        return x2 + 5
-    end
-
-    local last_idx = math.min(#items, scroll_off + vis)
-    for i = scroll_off + 1, last_idx do
-        local item = items[i]
-        local row_y1 = body_y1 + (i - scroll_off - 1) * row_h
-        local row_y2 = math.min(row_y1 + row_h, body_y2)
-        local is_sel = focused and (i == selected_idx)
-        local is_hov = (hover_panel == "episodes" and hover_index == i and not is_sel)
-
-        if is_sel then
-            table.insert(chunks, D.ev_rect(rect.x1 + 2, row_y1 + 1, rect.x2 - 2, row_y2 - 1, THEME.accent, 18, nil, 0, 0, o.corner_radius_row))
-            table.insert(chunks, D.ev_rect(rect.x1 + 2, row_y1 + 1, rect.x1 + 5, row_y2 - 1, THEME.accent, 100, nil, 0, 0, o.corner_radius_small))
-        elseif is_hov then
-            table.insert(chunks, D.ev_rect(rect.x1 + 2, row_y1 + 1, rect.x2 - 2, row_y2 - 1, "FFFFFF", 7, nil, 0, 0, o.corner_radius_row))
-        end
-
-        local icon, icon_col
-        if item.is_dir then
-            icon, icon_col = ICONS.folder_closed, THEME.folder
-        elseif U.is_video(item.name) then
-            icon, icon_col = ICONS.video, THEME.video
-        elseif U.is_audio(item.name) then
-            icon, icon_col = ICONS.audio, THEME.audio
-        else
-            icon, icon_col = ICONS.file, THEME.file
-        end
-
-        local name_x = rect.x1 + 14
-        local name_y = row_y1 + row_h / 2
-        local name_col = is_sel and THEME.accent or (focused and THEME.text_primary or THEME.text_muted)
-        local scroll_pad = (#items > vis) and 10 or 0
-
-        -- right-hand text: path (search results / continue list) or size
-        local right_text, right_col = nil, THEME.text_muted
-        local hist = watch_history[item.href]
-        local use_right_status = o.show_status_text and not is_global and not item.cw and not item.is_dir
-        if use_right_status then
-            if watched_set[item.href] then
-                right_text, right_col = ICONS.watched .. " " .. tostring(o.watched_label or "Watched"), THEME.good
-            elseif hist and hist.pos and hist.duration and hist.duration > 0 then
-                local pct = math.floor(math.min(1, hist.pos / hist.duration) * 100)
-                right_text, right_col = string.format("%s %d%% - %s left", ICONS.watching, pct,
-                    U.fmt_time(math.max(0, hist.duration - hist.pos))), THEME.warn
-            end
-        end
-        if is_global then
-            right_text = U.fit_text(U.percent_decode(item.dirpath or ""):gsub("^/", ""), (rect.x2 - rect.x1) * 0.34, fs - 6)
-            if right_text == "" then right_text = "/" end
-        elseif item.cw then
-            right_text = U.fit_text(U.basename(item.dirpath or ""), (rect.x2 - rect.x1) * 0.30, fs - 6)
-        end
-        local right_w = right_text and (U.utf8_len(right_text) * (fs - 6) * 0.55 + 22) or 18
-        right_w = right_w + scroll_pad
-
-        -- clean title + chips
-        local cp = (clean and not item.is_dir and U.is_media(item.name)) and CT.parse(item.name) or nil
-        local shown_name, name_suffix = item.name, ""
-        local chip_labels = {}
-        if cp then
-            if cp.se then
-                shown_name = cp.se
-                if not uniform and cp.title ~= "" then
-                    name_suffix = string.format("  {\\fs%d\\c%s}%s", fs - 4, U.ass_color(THEME.text_muted), U.ass_escape(cp.title))
-                end
-            else
-                shown_name = cp.label
-            end
-            if o.clean_titles_chips then
-                for _, c in ipairs(cp.chips) do chip_labels[#chip_labels + 1] = c end
-            end
-        end
-        if item.cw == "next" then table.insert(chip_labels, 1, "NEXT") end
-        if item.cw == "resume" and hist and hist.pos then table.insert(chip_labels, 1, U.fmt_time(hist.pos)) end
-
-        local chips_w = 0
-        for _, c in ipairs(chip_labels) do chips_w = chips_w + U.utf8_len(c) * cfs * 0.62 + 12 + 5 end
-        local size_text = (not item.is_dir and item.size and item.size > 0) and U.fmt_bytes(item.size) or nil
-        local size_w = size_text and (U.utf8_len(size_text) * (fs - 6) * 0.55 + 14) or 0
-
-        local status = ""
-        if o.show_watched_status and not use_right_status then
-            if watched_set[item.href] then
-                status = string.format("{\\c%s} %s", U.ass_color(THEME.good), ICONS.watched)
-            elseif hist then
-                status = string.format("{\\c%s} %s", U.ass_color(THEME.warn), ICONS.watching)
-            end
-        end
-
-        local icon_w_est = 30
-        local status_w_est = (status ~= "") and 26 or 0
-        local suffix_w_est = (name_suffix ~= "") and (U.utf8_len(cp and cp.title or "") * (fs - 4) * 0.55 + 14) or 0
-        -- Narrow panel? Give up the extras in priority order (size, then chips, then the status words)
-        -- so the name always keeps a readable minimum.
-        do
-            local keep_px = math.min(U.utf8_len(shown_name) * fs * 0.62, fs * 0.62 * 12)
-            local avail = rect.x2 - name_x - icon_w_est - status_w_est - suffix_w_est - 14
-            if avail - right_w - chips_w - size_w < keep_px then size_text, size_w = nil, 0 end
-            if avail - right_w - chips_w < keep_px then chip_labels, chips_w = {}, 0 end
-            if avail - right_w < keep_px and use_right_status and right_text then
-                right_text = right_text:match("^%S+")        -- just the tick / progress icon
-                right_w = U.utf8_len(right_text) * (fs - 6) * 0.55 + 22 + scroll_pad
-            end
-        end
-        local max_name_px = math.max(20, rect.x2 - name_x - right_w - chips_w - size_w - icon_w_est - status_w_est - suffix_w_est)
-        local display_name = U.fit_text(shown_name, max_name_px, fs)
-        if item.is_dir then display_name = display_name .. "/" end
-
-        local line = string.format("{\\c%s}%s  {\\c%s}%s%s%s",
-            U.ass_color(icon_col), icon, U.ass_color(name_col), U.ass_escape(display_name), name_suffix, status)
-        table.insert(chunks, D.ev_text(name_x, name_y, 4, string.format("%s\\fs%d", clip, fs), line))
-
-        if right_text then
-            table.insert(chunks, D.ev_text(rect.x2 - 16 - scroll_pad, name_y, 6,
-                string.format("%s\\fs%d\\c%s", clip, fs - 6, U.ass_color(right_col)),
-                U.ass_escape(right_text)))
-        end
-
-        -- chips and size sit right after the name (estimated end of the text), not at the row's edge
-        local cx = name_x + icon_w_est + U.utf8_len(display_name) * fs * 0.58 + suffix_w_est + status_w_est + 8
-        local limit = rect.x2 - right_w - 4
-        for k = 1, #chip_labels do
-            if cx > limit then break end
-            cx = draw_chip(cx, name_y, chip_labels[k], CT.chip_color(chip_labels[k]))
-        end
-        if size_text and cx + size_w <= limit + 8 then
-            table.insert(chunks, D.ev_text(cx + 2, name_y, 4,
-                string.format("%s\\fs%d\\c%s", clip, fs - 6, U.ass_color(THEME.text_dim)), U.ass_escape(size_text)))
         end
 
         if hist and hist.pos and hist.duration and hist.duration > 0 and not item.is_dir then
@@ -5852,7 +3769,9 @@ render = function()
     if search_active then
         hint = "Type to search   ↑↓ Results   Enter Confirm   Esc Cancel"
     else
-        hint = "↑↓ Move   Tab Panel   Enter Play/Open   ←/BS Up   / Filter   F Search all   A Queue   P Download+play   S Sort   R Refresh   M Watched   H Hide   D Debug   Esc Close"
+        local ck = (tostring(o.cache_clear_key or ""):match("[^%s,]+") or ""):upper()
+        hint = "↑↓ Move   Tab Panel   Enter Play/Open   ←/BS Up   / Filter   F Search all   A Queue   P Download+play   S Sort   R Refresh   M Watched   H Hide   "
+            .. (ck ~= "" and (ck .. " Clear cache   ") or "") .. "D Debug   Esc Close"
     end
     table.insert(chunks, D.ev_text(14, h - layout.footer_h + 16, 4,
         string.format("\\fs%d\\c%s", fs - 6, U.ass_color(THEME.text_muted)),
@@ -5864,6 +3783,13 @@ render = function()
         table.insert(chunks, D.ev_text(w - 14, h - layout.footer_h + 38, 6,
             string.format("\\fs%d\\c%s", fs - 6, U.ass_color(THEME.text_muted)),
             U.ass_escape(U.fit_text(IDX.summary(), w * 0.42, fs - 6))))
+    else
+        local dirs = MS.cache_stats()
+        local ctext = string.format("Cache %d folders%s", dirs,
+            (persist_status.cache_bytes and persist_status.cache_bytes > 0) and ("  ·  " .. ((persist_status.cache_bytes < 1048576)
+                and string.format("%d KB", math.ceil(persist_status.cache_bytes / 1024)) or U.fmt_bytes(persist_status.cache_bytes))) or "")
+        table.insert(chunks, D.ev_text(w - 14, h - layout.footer_h + 38, 6,
+            string.format("\\fs%d\\c%s", fs - 6, U.ass_color(MS.clear_armed and THEME.warn or THEME.text_muted)), U.ass_escape(ctext)))
     end
 
     -- ---- debug panel ----
@@ -5884,7 +3810,17 @@ render = function()
 
     -- ---- hover tooltip: full release name for rows whose title was cleaned ----
     local tip_name
-    if o.experimental_clean_titles and o.clean_titles_tooltip and hover_index and not MS.drag then
+    local function hover_is_live()
+        local mx, my = U.mouse_xy()
+        if not mx then return false end
+        for _, hb in ipairs(hitboxes) do
+            if hb.panel == hover_panel and hb.index == hover_index and mx >= hb.x1 and mx <= hb.x2 and my >= hb.y1 and my <= hb.y2 then
+                return true
+            end
+        end
+        return false
+    end
+    if o.experimental_clean_titles and o.clean_titles_tooltip and hover_index and not MS.drag and hover_is_live() then
         if hover_panel == "episodes" and search_scope ~= "global" then
             local it = ep_items[hover_index]
             if it and not it.is_dir and U.is_media(it.name) and CT.parse(it.name) then tip_name = it.name end
@@ -6168,6 +4104,36 @@ end
 REP, ONCE = { repeatable = true }, { repeatable = false }
 local CLICK = { complex = true }
 
+-- Listing cache (folder listings kept in the data file so the library opens instantly). The cache
+-- clear key (default ctrl+x) must be pressed twice; watch history, watched marks and sort choices stay.
+function MS.cache_stats()
+    local dirs, items = 0, 0
+    for _, c in pairs(dir_cache) do
+        if type(c) == "table" and type(c.entries) == "table" then dirs = dirs + 1; items = items + #c.entries end
+    end
+    return dirs, items
+end
+function MS.clear_cache_key()
+    local now = U.now_s()
+    local key = (tostring(o.cache_clear_key or ""):match("[^%s,]+") or "key"):upper()
+    if MS.clear_armed and now - MS.clear_armed < 6 then
+        MS.clear_armed = nil
+        local dirs = MS.cache_stats()
+        dir_cache = {}
+        MS.cache_version = (MS.cache_version or 0) + 1
+        MS.cache_dirty = true
+        save_dircache()
+        status_line = string.format("Cache cleared (%d folder listings). Watch history was not touched.", dirs)
+        refresh_current()
+    else
+        MS.clear_armed = now
+        local dirs, items = MS.cache_stats()
+        status_line = string.format("Press %s again to clear the listing cache (%d folders, %d items)", key, dirs, items)
+        mp.add_timeout(6, function() if MS.clear_armed == now then MS.clear_armed = nil; if browser_active then render() end end end)
+    end
+    render()
+end
+
 local function build_browse_bindings()
     local L = {}
     local function add(key, fn, flags) L[#L + 1] = { key, fn, flags or ONCE } end
@@ -6183,6 +4149,7 @@ local function build_browse_bindings()
     many(KEYS.right, function() open_selected(true) end);      add("l", function() open_selected(true) end)
     many(KEYS.left,  function() collapse_or_parent() end);     add("h", function() collapse_or_parent() end)
     many(KEYS.bs,    function() collapse_or_parent() end)
+    add("MBTN_BACK", function() collapse_or_parent() end)
     many(KEYS.tab,   function() switch_panel() end)
     add("a", function() queue_add_current() end)
     add("s", function() toggle_sort() end)
@@ -6194,7 +4161,20 @@ local function build_browse_bindings()
     add("p", function() MS.fb_manual(selected_file()) end)
     add("H", function() toggle_hide_watched() end)
     add("d", function() MS.debug = not MS.debug; render() end)
+    for k in tostring(o.cache_clear_key or ""):gmatch("[^%s,]+") do add(k, function() MS.clear_cache_key() end) end
     add("ESC", esc_pressed)
+    -- gamepads (mpv: input-gamepad=yes) and TV remotes
+    many({ "GAMEPAD_DPAD_UP", "GAMEPAD_LEFT_STICK_UP" },       function() move_selection(-1) end, REP)
+    many({ "GAMEPAD_DPAD_DOWN", "GAMEPAD_LEFT_STICK_DOWN" },   function() move_selection(1) end, REP)
+    many({ "GAMEPAD_DPAD_RIGHT", "GAMEPAD_LEFT_STICK_RIGHT" }, function() open_selected(true) end)
+    many({ "GAMEPAD_DPAD_LEFT", "GAMEPAD_LEFT_STICK_LEFT" },   function() collapse_or_parent() end)
+    many({ "GAMEPAD_LEFT_SHOULDER", "CHANNEL_UP" },    function() move_selection(-10) end, REP)
+    many({ "GAMEPAD_RIGHT_SHOULDER", "CHANNEL_DOWN" }, function() move_selection(10) end, REP)
+    many({ "GAMEPAD_ACTION_DOWN", "PLAY", "PLAYPAUSE", "PLAYONLY" }, function() open_selected(false) end)
+    many({ "GAMEPAD_ACTION_RIGHT", "BACK", "CANCEL" }, esc_pressed)
+    add("GAMEPAD_ACTION_LEFT", function() toggle_watched(selected_file()) end)
+    add("GAMEPAD_ACTION_UP", function() queue_add_current() end)
+    many({ "GAMEPAD_START", "MENU" }, function() switch_panel() end)
     add("MBTN_LEFT", function(e) on_click(e) end, CLICK)
     add("MBTN_LEFT_DBL", function() on_dblclick() end)
     add("WHEEL_UP",   function() on_wheel(-1) end, REP)
@@ -6260,11 +4240,15 @@ bind_search = function()
     many("search_", KEYS.down,  function() move_selection(1) end, REP)
     many("search_", KEYS.pgup,  function() move_selection(-10) end, REP)
     many("search_", KEYS.pgdn,  function() move_selection(10) end, REP)
-    many("search_", KEYS.home,  function() select_edge(true) end)
-    many("search_", KEYS.end_,  function() select_edge(false) end)
-    -- swallowed so they don't seek the video while you type
-    many("search_", KEYS.left,  function() end)
-    many("search_", KEYS.right, function() end)
+    -- the text cursor
+    many("search_", KEYS.home,  function() MS.scur_move("home") end)
+    many("search_", KEYS.end_,  function() MS.scur_move("end") end)
+    many("search_", KEYS.left,  function() MS.scur_move(-1) end, REP)
+    many("search_", KEYS.right, function() MS.scur_move(1) end, REP)
+    add("search_cl", "ctrl+LEFT",  function() MS.scur_move(-2) end, REP)
+    add("search_cr", "ctrl+RIGHT", function() MS.scur_move(2) end, REP)
+    add("search_del", "DEL", function() MS.search_delete() end, REP)
+    add("search_kpdel", "KP_DEL", function() MS.search_delete() end, REP)
     many("search_", KEYS.tab,   function() end)
     add("search_click", "MBTN_LEFT", function(e) on_click(e) end, CLICK)
     add("search_dbl", "MBTN_LEFT_DBL", function() on_dblclick() end)
@@ -6287,7 +4271,6 @@ end
 -- (editing the .conf file does not fire on_update by itself), and by
 -- `script-message webdav-browser-reload-config`.
 local function apply_config_changes(changed)
-    local old_host = host_label
     normalize_options()
     THEME = build_theme()
     ICONS = build_icons()
@@ -6369,6 +4352,8 @@ local function reload_user_data()
     watched_set   = U.plain(data.watched)
     sort_by_dir   = U.plain(data.sort)
     index_meta    = U.plain(data.index)
+    MS.hints      = U.plain(data.hints)
+    MS.tracks     = U.plain(data.tracks)
     if mark_continue_dirty then mark_continue_dirty() end
     if browser_active then render() end
 end
@@ -6445,6 +4430,7 @@ mp.observe_property("duration", "number", function(_, v) if v then last_known_du
 --   * otherwise only counts as "in progress" after watch_min_secs AND watch_min_pct, so merely
 --     opening a file for a few seconds doesn't leave an in-progress marker behind
 local function record_progress(meta, pos, dur)
+    if meta and meta.finished and dur then pos = dur end        -- left through the "Next episode" card: watched
     if not (meta and pos and dur and dur > 0) then return false end
     local pct = pos / dur * 100
     if pos >= dur - o.watched_tail_secs or pct >= o.watched_threshold_pct then
@@ -6471,6 +4457,100 @@ mp.register_event("start-file", function()
     MS.starting_path = mp.get_property("path")
 end)
 
+-- ============================================================
+-- PER-SHOW AUDIO / SUBTITLE LANGUAGE
+-- ============================================================
+-- Pick Japanese audio + English subtitles once in any Bleach episode and every Bleach episode starts that way.
+-- Stored in the history file as tracks[show] = { a = audio language, s = subtitle language or "no" }.
+-- The show is the nearest folder above the file that has a real title (season / disc folders are skipped).
+MS.tracks = MS.tracks or {}
+function MS.show_key(href)
+    if not href then return nil end
+    local d = U.dirname(href)
+    local rootn = tostring(root_href or "/"):gsub("/+$", "")
+    for _ = 1, 4 do
+        local dn = d:gsub("/+$", "")
+        if dn == "" or dn == rootn then return nil end
+        local name = U.basename(d)
+        local fp = CT.parse_folder(name)
+        local t = tostring((fp and fp.title) or name)
+        local low = t:lower():gsub("^%s+", ""):gsub("%s+$", "")
+        local generic = low == "" or low:match("^season") or low:match("^s%d+$") or low:match("^disc") or low:match("^dis[ck]%s*%d")
+            or low:match("^specials?$") or low:match("^extras?$") or low:match("^%d+$") or low:match("^part%s*%d+$")
+        if not generic then return (low:gsub("[^%w]+", "")) end
+        d = U.dirname(d)
+    end
+    return nil
+end
+
+local function trk_lang(t)
+    if type(t) ~= "table" then return nil end
+    if t.lang and t.lang ~= "" then return tostring(t.lang):lower() end
+    if t.title and t.title ~= "" then return "title:" .. tostring(t.title):lower() end
+    return nil
+end
+
+-- Called from file-loaded: switch to the remembered languages (when this file has them).
+function MS.tracks_apply(meta)
+    MS.trk_loaded = mp.get_time()
+    MS.trk_key = nil
+    if not o.remember_tracks or not meta then return end
+    local key = MS.show_key(meta.href)
+    MS.trk_key = key
+    local rec = key and MS.tracks[key]
+    if type(rec) ~= "table" then return end
+    local list = mp.get_property_native("track-list") or {}
+    local function find(kind, want)
+        local best
+        for _, t in ipairs(list) do
+            if t.type == kind and trk_lang(t) == want then
+                local signs = tostring(t.title or ""):lower():find("sign") ~= nil
+                if not best or (best.forced and not t.forced) or (best.signs and not signs) then
+                    best = { id = t.id, forced = t.forced, signs = signs }
+                end
+            end
+        end
+        return best and best.id
+    end
+    local done = {}
+    if rec.a then
+        local id = find("audio", rec.a)
+        if id and id ~= mp.get_property_number("aid") then mp.set_property_number("aid", id) end
+        if id then done[#done + 1] = "audio " .. rec.a end
+    end
+    if rec.s == "no" then
+        mp.set_property("sid", "no"); done[#done + 1] = "no subtitles"
+    elseif rec.s then
+        local id = find("sub", rec.s)
+        if id and id ~= mp.get_property_number("sid") then mp.set_property_number("sid", id) end
+        if id then done[#done + 1] = "subtitles " .. rec.s end
+    end
+    MS.trk_loaded = mp.get_time()
+    if #done > 0 then msg.info("remembered tracks for " .. key .. ": " .. table.concat(done, ", ")) end
+end
+
+-- A track change by YOU (not mpv's own pick at load, not ours) is remembered for the show.
+local function trk_changed(kind)
+    if not o.remember_tracks or not now_playing or not MS.trk_key then return end
+    if mp.get_time() - (MS.trk_loaded or 0) < 1.5 then return end
+    local rec = MS.tracks[MS.trk_key] or {}
+    if kind == "audio" then
+        local l = trk_lang(mp.get_property_native("current-tracks/audio"))
+        if not l or rec.a == l then return end
+        rec.a = l
+    else
+        local sid = mp.get_property("sid")
+        local l = (sid == "no" or sid == nil) and "no" or trk_lang(mp.get_property_native("current-tracks/sub"))
+        if not l or rec.s == l then return end
+        rec.s = l
+    end
+    rec.t = os.time()
+    MS.tracks[MS.trk_key] = rec
+    debounced_save_persistence(2)
+end
+mp.observe_property("aid", "string", function() trk_changed("audio") end)
+mp.observe_property("sid", "string", function() trk_changed("sub") end)
+
 mp.register_event("file-loaded", function()
     local path = mp.get_property("path")
     -- A blur filter must never outlive the browser: if one is still in the chain while the browser is
@@ -6484,6 +4564,7 @@ mp.register_event("file-loaded", function()
     if MS.fb.active and path ~= MS.fb.local_url then MS.fb_stop(true) end
     local meta = path and pending_meta[path]
     now_playing = meta
+    pcall(MS.tracks_apply, meta)
     last_known_pos, last_known_dur = nil, nil
     if meta then
         retry_counts[meta.href] = nil              -- it opened fine: reset the retry budget
@@ -6538,7 +4619,7 @@ mp.register_event("end-file", function(event)
                 pending_meta[retry_url] = failed
                 loading_meta = failed
                 mp.osd_message(string.format("Retrying %s (%d/%d)", failed.name, attempts, o.max_retries), 3)
-                mp.add_timeout(o.retry_delay, function() queue_load(retry_url, "insert-next-play") end)
+                mp.add_timeout(o.retry_delay, function() queue_load(retry_url, "insert-next-play", failed.name) end)
             else
                 retry_counts[failed.href] = nil
                 mp.osd_message("Failed: " .. failed.name .. (event.file_error and (" (" .. tostring(event.file_error) .. ")") or ""), 5)
@@ -6594,7 +4675,7 @@ mp.add_periodic_timer(o.prefetch_check_interval_secs or 5, function()
         next_item = (o.autoplay_next and chained_next) and { href = chained_next.href, name = chained_next.name } or nil,
     }
 
-    queue_next(next_url)
+    queue_next(next_url, next_item.name)
     status_line = string.format("Buffering next: %s", next_item.name)
     if browser_active then render() end
 end)
@@ -6606,11 +4687,232 @@ mp.add_periodic_timer(0.12, function()
     end
 end)
 
+-- Every 4 s while the browser is open: re-list the folders you are looking at that are still filling up, and give
+-- each one a second look 5 s after its first listing this session (that is how a growing folder is noticed).
+MS.inview = MS.inview or function() return { current_path } end
+mp.add_periodic_timer(4, function()
+    if not browser_active then return end
+    local ok, list = pcall(MS.inview)
+    if not ok or type(list) ~= "table" then return end
+    local now = os.time()
+    for _, href in ipairs(list) do
+        local c = href and find_cached_dir(href)
+        if c and type(c.entries) == "table" and not MS.inflight[href] then
+            local again = MS.grow[href] ~= nil
+            if not again and (MS.seen[href] or 0) == 1 and now - (c.ts or now) >= 5 then again = true end
+            if again then fetch_listing(href, { silent = true }) end
+        end
+    end
+    render()
+end)
+
+-- ============================================================
+-- "NEXT EPISODE IN 10..." CARD
+-- ============================================================
+-- A card with the next episode's still (poster edition) and name, counting down while the next playlist entry is one
+-- of ours. The countdown follows the playback position, so pausing pauses it. Esc keeps watching, Enter plays now.
+-- When it is shown depends on the file's chapters and on whether a chapter-skip script is installed:
+--   * credits: the card appears when the trailing ED / Ending / Credits / Preview chapters start; at 0 the next episode
+--              starts (the rest of the credits is skipped and the episode counts as watched).
+--   * before:  a skip script (op-ed-pv-skip and the like) jumps over those chapters - straight to the next file when they
+--              are the last ones - so the countdown runs in the last seconds BEFORE them and ends where they begin.
+--   * no named chapters: the last next_episode_secs of the file.
+MS.ep_meta = MS.ep_meta or {}
+local NX = { id = 60, shown = nil, dismissed = nil, ov = nil, bound = false }
+
+-- Chapter names a skip script skips (the op-ed-pv-skip lists, plus "credits / ending / outro / preview" anywhere).
+NX.EXACT = {}
+for _, t in ipairs({ "op", "opening", "opening theme", " - op", "recap", "title", "#prologue", "intermission", "eye-catchers",
+    "ed", "ending", " - ed", "ending credits", "credits", "ending theme", "pv", "preview", "next episode preview",
+    "next ep. preview", "nextp ep. preview", "next", "next time", "endcard", " - ed card", "ed+cast", "cast" }) do NX.EXACT[t] = true end
+NX.START = { "opening theme", "recap", "title", "eye-catchers", "intermission", "#prologue", "op by ", "ed song - ", "ending theme",
+    "next episode preview" }
+NX.END = { " (opening theme)", " (#prologue)", " (title)", " (eye-catchers)", " (intermission)", " (recap)", " (ending theme)",
+    " (opening)", " - opening", " - op", " (ending)", "- ending", " - ed", " preview", " (next episode preview)" }
+function NX.tail_name(title)
+    local t = tostring(title or ""):lower()
+    if NX.EXACT[t] then return true end
+    for _, p in ipairs(NX.START) do if t:sub(1, #p) == p then return true end end
+    for _, p in ipairs(NX.END) do if #t >= #p and t:sub(-#p) == p then return true end end
+    return t:find("credits", 1, true) or t:find("ending", 1, true) or t:find("outro", 1, true) or t:find("preview", 1, true)
+        or t:match("^ed[%s%d:%-]") ~= nil
+end
+
+-- Is a chapter-skip script loaded? (its key bindings show up in mpv's input-bindings list)
+function NX.skipper()
+    if NX.sk_t and mp.get_time() - NX.sk_t < 60 then return NX.sk end
+    local ok, list = pcall(mp.get_property_native, "input-bindings")
+    local found = false
+    for _, b in ipairs(ok and type(list) == "table" and list or {}) do
+        local c = (tostring(b.cmd or "") .. " " .. tostring(b.section or "")):lower()
+        if c:find("op_ed_pv_skip", 1, true) or c:find("op-ed-pv-skip", 1, true) or c:find("chapterskip", 1, true)
+            or c:find("chapter_skip", 1, true) or c:find("skip_intro", 1, true) or c:find("skipintro", 1, true)
+            or c:find("autoskip", 1, true) then found = true; break end
+    end
+    NX.sk, NX.sk_t = found, mp.get_time()
+    return found
+end
+
+-- Start of the trailing ED / credits / preview chapters (nil when the file has none in its second half).
+function NX.tail_start(dur, skipper)
+    local list = mp.get_property_native("chapter-list") or {}
+    local n = #list
+    if n < 2 then return nil end
+    local named = false
+    for _, ch in ipairs(list) do
+        local t = tostring(ch.title or "")
+        if t ~= "" and not t:match("^Chapter ") then named = true; break end
+    end
+    local start
+    if named then
+        for i = n, 1, -1 do
+            if NX.tail_name(list[i].title) and (list[i].time or 0) > dur * 0.5 then start = list[i].time else break end
+        end
+    elseif skipper then
+        -- unnamed chapters: the skip script goes by length (PV 14-26 s as the last chapter, OP/ED 88-102 s)
+        for i = n, math.max(1, n - 2), -1 do
+            local len = ((list[i + 1] and list[i + 1].time) or dur) - (list[i].time or 0)
+            local pv = (i == n and len >= 14 and len <= 26)
+            if (pv or (len >= 88 and len <= 102)) and (list[i].time or 0) > dur * 0.5 then start = list[i].time else break end
+        end
+    end
+    return start
+end
+
+function NX.next_entry()
+    local pos = mp.get_property_number("playlist-pos")
+    local pl = mp.get_property_native("playlist")
+    if not (pos and type(pl) == "table") then return nil end
+    local nx = pl[pos + 2]           -- playlist-pos is 0-based, Lua tables 1-based
+    return nx and pending_meta[nx.filename]
+end
+
+function NX.hide()
+    if NX.shown then
+        if NX.ov then NX.ov.data = ""; NX.ov:update() end
+        pcall(mp.commandv, "overlay-remove", tostring(NX.id))
+        NX.shown, NX.bmp = nil, nil
+    end
+    if NX.bound then
+        for _, k in ipairs(NX.keys) do pcall(mp.remove_key_binding, "webdav_nx_" .. k) end
+        NX.bound = false
+    end
+end
+
+function NX.next()
+    NX.hide()
+    if now_playing then now_playing.finished = true end
+    mp.command("playlist-next")
+end
+
+NX.keys = { "ESC", "ENTER", "KP_ENTER", "GAMEPAD_ACTION_DOWN", "GAMEPAD_ACTION_RIGHT" }
+function NX.bind(href)
+    if NX.bound then return end
+    NX.bound = true
+    local function stay() NX.dismissed = href; NX.hide() end
+    for _, k in ipairs(NX.keys) do
+        local fn = (k == "ESC" or k == "GAMEPAD_ACTION_RIGHT") and stay or NX.next
+        mp.add_forced_key_binding(k, "webdav_nx_" .. k, fn)
+    end
+end
+
+-- Label ("S02E28"), episode name and show for the card: the title page's TMDB data when known, else the file name.
+function NX.info(meta)
+    local em = MS.ep_meta[meta.href] or {}
+    local cp = CT.parse(meta.name or "")
+    local name = em.name or (cp and cp.ep) or (cp and cp.title) or meta.name or ""
+    return em.label or (cp and cp.se), name
+end
+
+function NX.draw(meta, left, sw, sh, f)
+    local ww, wh = mp.get_osd_size()
+    if not ww or ww <= 0 then return end
+    NX.ov = NX.ov or mp.create_osd_overlay("ass-events")
+    local S = wh / 1080
+    local fs = math.max(14, math.floor(21 * S))
+    local pad = math.floor(14 * S)
+    local has_still = sw > 0
+    local tw = has_still and math.floor(sw * 1.15) or math.floor(wh * 0.30)     -- text column (beside the still)
+    local pw = (has_still and (sw + pad) or 0) + tw + 2 * pad
+    local ph = math.max(has_still and sh or 0, math.floor(fs * 6.4)) + 2 * pad
+    local x1 = ww - pw - math.floor(40 * S)
+    local y1 = wh - ph - math.floor(100 * S)
+    local sy = y1 + math.floor((ph - sh) / 2)                -- the still, centred vertically
+    local label, name = NX.info(meta)
+    local ev = {}
+    ev[#ev + 1] = D.ev_rect(x1, y1, x1 + pw, y1 + ph, THEME.bg_header, 92, THEME.accent, 55, 1, math.floor(12 * S))
+    if has_still and not f then ev[#ev + 1] = D.ev_rect(x1 + pad, sy, x1 + pad + sw, sy + sh, THEME.bg_panel, 100, nil, 0, 0, NX.radius or 0) end
+    local tx, ty = x1 + pad + (has_still and (sw + pad) or 0), y1 + pad
+    local function line(y, tags, txt) ev[#ev + 1] = D.ev_text(tx, y, 7, tags, txt) end
+    line(ty, string.format("\\b1\\fs%d\\c%s", fs + 3, U.ass_color("FFFFFF")), "Next episode in " .. math.max(0, math.ceil(left)))
+    local ny = ty + fs * 1.6
+    if label then
+        line(ny, string.format("\\b1\\fs%d\\c%s", fs, U.ass_color(THEME.accent)), U.ass_escape(label))
+        ny = ny + fs * 1.3
+    end
+    line(ny, string.format("\\fs%d\\c%s", fs, U.ass_color(THEME.text_primary)), U.ass_escape(U.fit_text(name, tw, fs)))
+    ev[#ev + 1] = D.ev_text(tx, y1 + ph - pad, 1, string.format("\\fs%d\\c%s", fs - 5, U.ass_color(THEME.text_muted)),
+        U.ass_escape(U.fit_text("Enter play  ·  Esc stay", tw, fs - 5)))
+    -- countdown bar along the bottom of the card
+    local frac = math.max(0, math.min(1, left / math.max(1, tonumber(o.next_episode_secs) or 10)))
+    local bh = math.max(3, math.floor(4 * S))
+    ev[#ev + 1] = D.ev_rect(x1 + pad, y1 + ph - bh - 2, x1 + pad + (pw - 2 * pad) * frac, y1 + ph - 2, THEME.accent, 100, nil, 0, 0, 2)
+    NX.ov.res_x, NX.ov.res_y = ww, wh
+    NX.ov.data = table.concat(ev, "\n")
+    NX.ov:update()
+    if f then
+        local bx, by = math.floor(x1 + pad), math.floor(sy)
+        local sig = f .. "@" .. bx .. "," .. by
+        if NX.bmp ~= sig then
+            NX.bmp = mp.commandv("overlay-add", tostring(NX.id), tostring(bx), tostring(by), f, "0", "bgra",
+                tostring(sw), tostring(sh), tostring(sw * 4)) and sig or nil
+        end
+    end
+    NX.shown = true
+end
+
+
+-- list edition: no artwork, just the text
+function NX.size() return 0, 0 end
+function NX.still() return nil end
+
+mp.add_periodic_timer(0.2, function()
+    if not o.next_episode_card or not now_playing or browser_active then NX.hide(); return end
+    local href = now_playing.href
+    if NX.dismissed and NX.dismissed ~= href then NX.dismissed = nil end
+    local pos, dur = mp.get_property_number("time-pos"), mp.get_property_number("duration")
+    if not (pos and dur and dur > 60) or NX.dismissed == href then NX.hide(); return end
+    local secs = math.max(3, tonumber(o.next_episode_secs) or 10)
+    local timing = tostring(o.next_episode_timing or "auto"):lower()
+    local skipper = NX.skipper()
+    if timing ~= "credits" and timing ~= "before" then timing = skipper and "before" or "credits" end
+    local tail = NX.tail_start(dur, skipper or timing == "before")
+    local t0, t_go
+    if tail and timing == "before" then t0, t_go = tail - secs, tail - 0.45   -- leave just before the skip script jumps
+    elseif tail then t0, t_go = tail, tail + secs
+    else t0 = dur - secs - 1 end
+    if pos < t0 - 90 then NX.hide(); return end
+    local meta = NX.next_entry()
+    if not meta then NX.hide(); return end
+    local sw, sh = NX.size()
+    local f = NX.still(meta, sw, sh)                 -- starts early, so the still is ready when the card appears
+    if pos < t0 or pos >= dur - 0.3 then NX.hide(); return end
+    local left = (t_go or (t0 + secs)) - pos
+    if left <= 0 then
+        NX.hide()
+        if t_go then NX.dismissed = href; NX.next() end
+        return
+    end
+    NX.bind(href)
+    NX.draw(meta, left, sw, sh, f)
+end)
+
 mp.register_event("shutdown", function()
     index_stop()
     if MS.active then
         if now_playing then record_progress(now_playing, last_known_pos, last_known_dur) end
         save_persistence()
+        if MS.cache_dirty then save_dircache() end
     end
     if MS.fb.active then MS.fb_stop(true) end
     for pth in pairs(MS.fb_dirty_files) do pcall(os.remove, pth) end
