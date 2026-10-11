@@ -1,7 +1,7 @@
 # webdav-browser for mpv
 Browse and play a WebDAV video library (built for Real-Debrid, works with any WebDAV server) inside mpv.
 
-<p align="center">
+<p>
 <img width="45%" alt="webdav-browser-posters" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
 <img width="45%" alt="webdav-browser" src="https://github.com/user-attachments/assets/fede1596-b8ff-4095-a579-49964efa24d1" />
 </p>
