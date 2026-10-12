@@ -9,10 +9,12 @@
 <p align="center">The script Have Two UI's to choose from:</p>
 
 <div align="center">
-| Script | Look | Opens with |
+	<p>| Script | Look | Opens with |
 |---|---|---|
 | `webdav-browser-posters.lua` | Netflix-style posters, title pages, episode stills | `Ctrl+P` |
 <img width="85%" alt="webdav-browser-posters" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
+	</p>
+
 <br/>
 <br/>
 | Script | Look | Opens with |
