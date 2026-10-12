@@ -22,7 +22,7 @@ Browse and play a WebDAV video library (built for Real-Debrid, works with any We
 |---|---|---|
 | `webdav-browser.lua` | Fast two-panel list (Folders \| Files) | `Ctrl+W` |
 
-<img width="55%" alt="webdav-browser" src="https://github.com/user-attachments/assets/fede1596-b8ff-4095-a579-49964efa24d1" />
+<img width="85%" alt="webdav-browser" src="https://github.com/user-attachments/assets/fede1596-b8ff-4095-a579-49964efa24d1" />
 
 </div>
 
