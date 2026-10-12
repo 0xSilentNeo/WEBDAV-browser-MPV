@@ -4,14 +4,17 @@
 		Browse and play a WebDAV video library (built for Real-Debrid, works with any WebDAV server) inside <a href="https://mpv.io">MPV</a>.
 	</p>
 	<br/>
-        <img width="85%" alt="webdav-browser-posters" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
-        <img width="55%" alt="webdav-browser" src="https://github.com/user-attachments/assets/fede1596-b8ff-4095-a579-49964efa24d1" />
 </div>
+
+<p align="center">The script Have Two UI's to choose from:</p>
+
 
 | Script | Look | Opens with |
 |---|---|---|
 | `webdav-browser-posters.lua` | Netflix-style posters, title pages, episode stills | `Ctrl+P` |
+<img width="85%" alt="webdav-browser-posters" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
 | `webdav-browser.lua` | Fast two-panel list (Folders \| Files) | `Ctrl+W` |
+<img width="55%" alt="webdav-browser" src="https://github.com/user-attachments/assets/fede1596-b8ff-4095-a579-49964efa24d1" />
 
 Both share one config file and one watch history, and can be installed side by side.
 
