@@ -1,26 +1,29 @@
 <div align="center">
-	<h1>webdav-browser</h1>
-	<p>
-		Browse and play a WebDAV video library (built for Real-Debrid, works with any WebDAV server) inside <a href="https://mpv.io">MPV</a>.
-	</p>
-	<br/>
+
+# webdav-browser
+
+Browse and play a WebDAV video library (built for Real-Debrid, works with any WebDAV server) inside [MPV](https://mpv.io).
+
 </div>
 
-<p align="center">The script Have Two UI's to choose from:</p>
+<p align="center">The script has two UIs to choose from:</p>
 
 <div align="center">
-	<p>| Script | Look | Opens with |
+
+| Script | Look | Opens with |
 |---|---|---|
 | `webdav-browser-posters.lua` | Netflix-style posters, title pages, episode stills | `Ctrl+P` |
-<img width="85%" alt="webdav-browser-posters" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
-	</p>
 
-<br/>
-<br/>
+<img width="85%" alt="webdav-browser-posters" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
+
+<br/><br/>
+
 | Script | Look | Opens with |
 |---|---|---|
 | `webdav-browser.lua` | Fast two-panel list (Folders \| Files) | `Ctrl+W` |
+
 <img width="55%" alt="webdav-browser" src="https://github.com/user-attachments/assets/fede1596-b8ff-4095-a579-49964efa24d1" />
+
 </div>
 
 <br/>
@@ -30,8 +33,9 @@ Both share one config file and one watch history, and can be installed side by s
 ## Install
 
 1. Put the `.lua` file(s) in `<mpv config>/scripts/` (Windows: `%APPDATA%\mpv\scripts\`).
+
 2. Put `webdav-browser.conf` in `<mpv config>/script-opts/` and add your login:
-   ```
+   ```ini
    user=YOUR_USERNAME
    pass=YOUR_WEBDAV_PASSWORD
    ```
