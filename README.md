@@ -13,10 +13,10 @@ Browse and play a WebDAV video library (built for Real-Debrid, works with any We
 | Script | Look | Opens with |
 |---|---|---|
 | `webdav-browser-posters.lua` | Netflix-style posters, title pages, episode stills | `Ctrl+P` |
-<kbd width="84%"> 
-<img width="85%" alt="webdav-browser-posters" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
-</kbd>
 
+<a href="url"><img src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" height="auto" width="85%" style="border-radius:50%"></a>
+
+<img width="85%" alt="webdav-browser-posters" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
 
 <br/><br/>
 
