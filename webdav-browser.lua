@@ -1,5 +1,5 @@
 --[[
-webdav-browser v13.1  -  two-panel (Folders | Files) WebDAV browser for mpv, for a Real-Debrid (or any) WebDAV library
+webdav-browser v22  -  two-panel (Folders | Files) WebDAV browser for mpv, for a Real-Debrid (or any) WebDAV library
 
 Ctrl+W opens / closes it. Settings: script-opts/webdav-browser.conf (shared with webdav-browser-posters.lua, the
 poster edition; both can be installed side by side - the one opened
@@ -10,13 +10,68 @@ the comments of the conf.
 local mp      = require("mp")
 local utils   = require("mp.utils")
 local msg     = require("mp.msg")
+
+-- Key names change between mpv versions (0.41 renamed BACK to GO_BACK), and a key mpv does not know makes it print
+-- "[input] Unknown key" errors. Every binding this script adds goes through here: a name the running mpv does not list
+-- in input-key-list is skipped (logged once). Plain characters, and keys with modifiers on them, are checked by
+-- their last part ("ctrl+x" -> "x"). Older mpv without that list: everything is passed through as before.
+do
+    local known = nil
+    local ok_list, list = pcall(mp.get_property_native, "input-key-list")
+    if ok_list and type(list) == "table" and #list > 0 then
+        known = {}
+        for _, k in ipairs(list) do known[tostring(k):upper()] = true end
+    end
+    local warned = {}
+    local function usable(key)
+        if type(key) ~= "string" or not known then return true end
+        local base = key:match("%+$") and "+" or (key:match("([^+]+)$") or key)
+        if #base == 1 or base:byte(1) >= 128 then return true end      -- a character (also non-ASCII ones)
+        if known[base:upper()] then return true end
+        if not warned[key] then warned[key] = true; msg.verbose("skipped key '" .. key .. "': this mpv does not know it") end
+        return false
+    end
+    local add_forced, add_plain = mp.add_forced_key_binding, mp.add_key_binding
+    mp.add_forced_key_binding = function(key, ...) if not usable(key) then return end return add_forced(key, ...) end
+    mp.add_key_binding = function(key, ...) if not usable(key) then return end return add_plain(key, ...) end
+end
+-- Safety net: an error in a timer, event, key or async answer is logged (and said once in a toast) and the script
+-- carries on, instead of the error ending the script's event loop.
+do
+    local unpack_ = table.unpack or unpack
+    local last_t = 0
+    local function report(err)
+        msg.error("caught an error (the script carries on): " .. debug.traceback(tostring(err), 2))
+        local now = mp.get_time()
+        if mp.wb_on_bug and now - last_t > 20 then last_t = now; pcall(mp.wb_on_bug, tostring(err)) end
+        return err
+    end
+    local function guard(fn)
+        if type(fn) ~= "function" then return fn end
+        return function(...)
+            local n, a = select("#", ...), { ... }
+            local ok, r1, r2, r3 = xpcall(function() return fn(unpack_(a, 1, n)) end, report)
+            if ok then return r1, r2, r3 end
+        end
+    end
+    local function wrap_fns(...)
+        local n, a = select("#", ...), { ... }
+        for i = 1, n do if type(a[i]) == "function" then a[i] = guard(a[i]) end end
+        return unpack_(a, 1, n)
+    end
+    for _, name in ipairs({ "add_timeout", "add_periodic_timer", "register_event", "register_script_message",
+                            "add_key_binding", "add_forced_key_binding", "observe_property", "command_native_async", "add_hook" }) do
+        local f0 = mp[name]
+        if type(f0) == "function" then mp[name] = function(...) return f0(wrap_fns(...)) end end
+    end
+end
 local options = require("mp.options")
 
 -- Namespaces (Lua 5.1 allows only 200 local variables per function, so pure helpers live in tables)
 local U = {}   -- utilities: text / url / time / matching helpers
 local D = {}   -- ASS drawing primitives
 
-local SCRIPT_VERSION = "v13.1"
+local SCRIPT_VERSION = "v26.11"
 
 -- ============================================================
 -- OPTIONS  (edit these via script-opts/webdav-browser.conf)
@@ -102,33 +157,40 @@ local o = {
     -- is shown via brightness/fill instead of a blue accent border).
     border_gradient_enabled = true,    -- Enable the LiquidGlass-style gradient border
     border_alpha            = 42,      -- Base opacity (0-100) of the gradient border strokes (focused panel gets a bit more)
-    color_border_grad_top    = "FF9CC2", -- Gradient border color at the very top    (Sakura pink)
-    color_border_grad_mid    = "2B2140", -- Gradient border color in the middle      (deep violet)
-    color_border_grad_bottom = "B79CFF", -- Gradient border color at the very bottom (lavender)
+    color_border_grad_top    = "", -- Gradient border color at the very top    (Sakura pink)
+    color_border_grad_mid    = "", -- Gradient border color in the middle      (deep violet)
+    color_border_grad_bottom = "", -- Gradient border color at the very bottom (lavender)
     glass_highlight_enabled  = true,   -- Thin bright line just inside the top edge of each panel (simulated light-on-glass)
     glass_highlight_opacity  = 14,     -- Opacity (0-100) of that highlight line - keep low, it's meant to be subtle
 
-    -- ===== Colors (hex, no '#') - "Sakura Night" =====
-    -- NOTE: if your webdav-browser.conf still lists old color_* lines they override these defaults.
-    color_bg_dim         = "08050F",  -- Full-screen dimming overlay color (behind everything)
-    color_bg_header      = "100C18",  -- Top title bar & bottom status bar background
-    color_bg_panel       = "221A2F",  -- Focused panel background
-    color_bg_panel_dim   = "1A1425",  -- Unfocused panel background
-    color_accent         = "FF8FB8",  -- Primary accent color: selection highlight, active labels, search box
+    -- ===== Colors (hex, no '#') =====
+    -- theme picks a whole palette: classic ("Sakura Night") | graphite | netflix | rose | ios. Every color_* below is
+    -- empty = from the theme; one you set (in webdav-browser.conf) wins over the theme for that colour only.
+    theme                = "classic",
+    color_star           = "",  -- The rating star (★ 8.1) on cards and the title page
+    color_bg_dim         = "",  -- Full-screen dimming overlay color (behind everything)
+    color_bg_header      = "",  -- Top title bar & bottom status bar background
+    color_bg_panel       = "",  -- Focused panel background
+    color_bg_panel_dim   = "",  -- Unfocused panel background
+    color_accent         = "",  -- Primary accent color: selection highlight, active labels, search box
     color_border_focus   = "",        -- Unused (kept for backwards-compat with old config files)
-    color_border_unfocus = "3A2D4F",  -- Fallback flat border color, only used if border_gradient_enabled = false
-    color_text_primary   = "FAF5FF",  -- Main text color (focused panel, unselected rows)
-    color_text_muted     = "B2A8C6",  -- Secondary text color (unfocused panel text, sizes, breadcrumbs)
-    color_text_dim       = "867C9A",  -- Dimmed text for empty-state messages
-    color_good           = "7FE3B0",  -- "Connected" status dot + fully-watched marker
-    color_bad            = "FF6B8B",  -- "Error" status dot + error messages
-    color_warn           = "FFB86B",  -- In-progress (partially watched) marker color + confirmed search chip
-    color_folder         = "FFD6A5",  -- Folder icon/name color
-    color_video          = "8EC5FF",  -- Video file icon color
-    color_audio          = "C9A7FF",  -- Audio file icon color
-    color_file           = "A59BB8",  -- Generic (non-media) file icon color
-    color_cached_folder  = "9C92B0",  -- Name color for folders already cached (instant reopen, no network fetch)
-    color_track          = "3B2F52",  -- Scrollbar track + progress-bar track
+    color_border_unfocus = "",  -- Fallback flat border color, only used if border_gradient_enabled = false
+    color_text_primary   = "",  -- Main text color (focused panel, unselected rows)
+    color_text_muted     = "",  -- Secondary text color (unfocused panel text, sizes, breadcrumbs)
+    color_text_dim       = "",  -- Dimmed text for empty-state messages
+    color_good           = "",  -- "Connected" status dot + fully-watched marker
+    color_bad            = "",  -- "Error" status dot + error messages
+    color_warn           = "",  -- In-progress (partially watched) marker color + confirmed search chip
+    color_folder         = "",  -- Folder icon/name color
+    color_video          = "",  -- Video file icon color
+    color_audio          = "",  -- Audio file icon color
+    color_file           = "",  -- Generic (non-media) file icon color
+    color_cached_folder  = "",  -- Name color for folders already cached (instant reopen, no network fetch)
+    color_track          = "",  -- Scrollbar track + progress-bar track
+    -- the glass toasts and cards (Ready, Up next, Now playing, the download cards): a palette of their own
+    toast_theme          = "classic",
+    toast_color_fill = "", toast_color_edge = "", toast_color_text = "", toast_color_accent = "",
+    toast_color_good = "", toast_color_warn = "", toast_color_bad = "", toast_color_ring = "",
 
     -- ===== Icons =====
     -- icon_style picks a built-in icon set: "emoji" | "minimal" | "ascii"
@@ -158,27 +220,82 @@ local o = {
     index_max_dirs = 4000,         -- Safety cap on folders visited per crawl
     index_max_results = 400,       -- Max rows shown for one search
 
-    -- ===== Clean titles (EXPERIMENTAL) =====
-    experimental_clean_titles = true,  -- Show "S01E03" + quality chips instead of the raw release name (full name on hover)
+    -- ===== Clean titles =====
+    clean_titles = true,               -- Show "S01E03" + quality chips instead of the raw release name (full name on hover)
     clean_titles_chips = true,         -- Quality chips: 4K / 1080p / HDR / DV / ATMOS / REMUX ...
     clean_titles_tooltip = true,       -- Hovering a row shows its full release name in a tooltip
     -- (used by webdav-browser-posters.lua only; listed so the shared conf does not warn)
-    home_view = true, home_card_pct = 19, home_recent_count = 20,
+    home_view = true, home_card_pct = 16, home_recent_count = 20,
+    landscape_card_pct = 25, episode_card_pct = 26, transitions = true,   -- poster edition only (new in 24)
+    top_bar_scale = 0.8, experimental_glass_bars = false,   -- poster edition only (new in 25)
+    hide_osc = true,                -- Hide the player's controller (osc / ModernZ) while the browser is open, so it can't show through
+    osc_visibility = "auto",        -- ...and give it this visibility back when the browser closes: auto | always
+    pulse = true,                      -- The download card's bar glows and sweeps while it waits (no = still)
+    download_card_position = "center", -- The download-while-playing card: top-left, top, top-right, center, bottom-left, bottom, bottom-right
+    focus_style = "dim", dim_others_pct = 40, hero_poster = true, hero_poster_pct = 100, download_dir = "", key_more = "i",
+    transition_style = "zoom", card_gap_pct = 9, card_spread = false, season_card_pct = 0, search_cast = false,
+    search_keywords = false, focus_ring = false, card_label_pct = 60, smooth_scroll = true,   -- poster edition only (new in 26)
+    nyaa_fallback = "ask", nyaa_fallback_below = 5, key_downloads = "D",   -- poster edition only (new in 26.2)
+    nyaa_button = "anime", track_shows = true, track_check_hours = 3, track_bell = "all", key_tracked = "u",   -- poster edition only (new in 26.3)
+    play_local_first = true, skip_intro_card = true, home_filter_chips = true, track_view = "list", track_cached_check = true,   -- poster edition only (new in 26.4)
+    single_click_open = true,   -- one click on a file plays it (no = select with one click, play with a double-click) (new in 26.5)
+    track_bell_anim = true,     -- poster edition only (new in 26.5)
+    experimental_video_glass = false, experimental_video_glass_pct = 72, experimental_hero_wash = false, experimental_hero_wash_pct = 14,
+    experimental_title_logo = false, experimental_new_badges = false, experimental_hover_lift = false, experimental_exit_anim = false,
+    experimental_empty_states = false,   -- poster edition only (new in 26.4, experimental; their new names since 26.6:)
+    hero_wash = true, hero_wash_pct = 14, title_logo = true, new_badges = true, hover_lift = true, exit_anim = true, empty_states = true,
+    experimental_mouse_ui = false, track_air_times = true, track_watch_release = true, track_poll_mins = 15, track_sound = "yes",
+    clock_24h = false,   -- poster edition only (new in 26.6)
+    scroll_blur = true, bottom_reveal_secs = 0, hover_buttons = true,   -- poster edition only (new in 26.7)
+    playback_toasts = true,   -- messages while playing (Resumed at..., Retrying...) as glass pills instead of mpv's plain text (new in 26.7)
     merge_seasons = true, queue_folder = true, queue_max = 200,   -- poster edition only (listed so the shared conf does not warn)
     cache_clear_key = "ctrl+x",        -- Press twice to clear the folder-listing cache (watch history is never touched)
-    rd_api_token = "", rd_api_base = "https://api.real-debrid.com/rest/1.0", experimental_merge_by_tmdb = false,
+    rd_api_token = "", rd_api_base = "https://api.real-debrid.com/rest/1.0", merge_by_tmdb = false, poster_column = true, animations = false,
     poster_overrides = "", show_missing_episodes = true,   -- poster edition only
-    ui_scale = 1.0, continue_landscape = true, experimental_animations = false,   -- poster edition only
-    open_key_posters = "ctrl+p", experimental_posters = true, tmdb_key = "", poster_column_pct = 17,
+    ui_scale = 1.0, continue_landscape = true,   -- poster edition only
+    open_key_posters = "ctrl+p", tmdb_key = "", poster_column_pct = 17,
     poster_converter = "auto", poster_cache_dir = "", ffmpeg_path = "ffmpeg", magick_path = "magick",
     tmdb_api_base = "", tmdb_image_base = "",
     -- New in 13 (poster edition only, listed so the shared conf does not warn)
     anime_lookup = true, anime_map_url = "", anilist_api = "", card_radius = 6, card_shadows = true, selected_grow = 1.06,
     idle_prefetch_rows = 3, couch_mode = "auto", couch_open_keys = "GAMEPAD_BACK",
-    experimental_backdrop = false,
+    cache_max_age_days = 0,              -- poster edition only (new in 26.9)
+    -- New in 26.10 (EXPERIMENTAL, off unless set). Here: the blinking cursor and the list fading out as it closes. The
+    -- rest belongs to the poster edition (listed so the shared conf does not warn)
+    experimental_caret = false, experimental_exit_to_video = false,
+    experimental_np_flip = false,        -- (26.10 only, taken out in 26.11; still read so an older conf does not warn)
+    experimental_rubberband = false, experimental_parallax = false, experimental_play_tilt = false, experimental_search_collapse = false,
+    experimental_live_search = false, experimental_chip_stagger = false, experimental_decode = false,
+    experimental_row_drag = false,       -- poster edition only (new in 26.11)
+    experimental_backdrop = false, precache_artwork = true, addon_urls = "", add_key = "n", aiostreams_password = "",   -- poster edition only
+    nyaa_url = "", nyaa_category = "1_0",   -- poster edition only
+    addon_region = "US", addon_providers = "", torrent_client = "rqbit", torrent_port = 3030, torrent_client_args = "",
+    torrent_trackers = "",               -- poster edition only (new in 19)
+    torrent_start_mb = 50, key_doctor = "F1",   -- poster edition only (new in 20)
+    ui_size_steps = true, animation_fps = 0,    -- poster edition only (new in 22)
+    startup_toast = true,                -- a short glass note when mpv starts (no = none; with both editions loaded the
+                                         -- poster edition shows one note for both)
+    torrent_fallback = "auto",           -- poster edition only (new in 23)
+    -- New in 17: keys inside the browser (space-separated mpv key names; empty = no key). They only exist while the
+    -- browser is open, and while it is open they win over the same keys in input.conf / other scripts.
+    key_up = "UP KP_UP KP8 k", key_down = "DOWN KP_DOWN KP2 j", key_left = "LEFT KP_LEFT KP4 h", key_right = "RIGHT KP_RIGHT KP6 l",
+    key_page_up = "PGUP", key_page_down = "PGDWN", key_first = "HOME", key_last = "END",
+    key_open = "ENTER KP_ENTER KP5", key_back = "BS MBTN_BACK", key_close = "ESC", right_click_back = false,
+    key_search = "f", key_search_folder = "/", key_sort = "s", key_queue = "a", key_watched = "m",
+    key_refresh = "r", key_refresh_all = "R", key_refetch_art = "t", key_switch_view = "v o", key_report = "ctrl+d",
+    key_debug = "d", key_switch_panel = "TAB", key_hide_watched = "H", key_play_download = "p",
+    -- the old names of options that are no longer experimental (still read, so older confs keep working)
+    experimental_clean_titles = true, experimental_posters = true, experimental_animations = false, experimental_merge_by_tmdb = false,
     remember_tracks = true,            -- Remember the audio + subtitle language per show (pick once, every episode starts that way)
     next_episode_card = true,          -- "Next episode in 10..." card near the end credits (Esc = stay, Enter = play now)
     next_episode_secs = 10,            -- Length of that countdown
+    now_playing_card = true,           -- a small card for a few seconds when a file starts from the browser
+    now_playing_secs = 4,              -- how long it stays
+    -- New in 23: where the cards and the startup toast sit: top-left, top, top-right, bottom-left, bottom, bottom-right
+    next_card_position = "bottom-right",
+    now_playing_position = "bottom-left",
+    startup_toast_position = "top-right",
+    glass_blur = true,                 -- the cards blur the video behind them (needs vo=gpu-next; otherwise they are tinted)
     next_episode_timing = "auto",      -- auto | credits | before (before = ends where the ED begins, for chapter-skip scripts)
     open_key = "ctrl+w",               -- Key(s) that open/close the browser (separate several with spaces), e.g. "ctrl+w ctrl+p"
     clean_folder_titles = true,        -- Also clean the folder names in the left panel (title + season + quality + release group)
@@ -215,7 +332,7 @@ local o = {
     fallback_stall_secs = 45,      -- How long playback waits for the download to catch up before giving up
     fallback_keep = false,         -- Keep the downloaded file after playback (false = delete it)
     fallback_cleanup_hours = 24,   -- Leftover files older than this are removed at startup
-    curl_auth_mode = "auto",       -- "auto" | "arg" | "stdin": how credentials reach curl (auto = arg on Windows, stdin elsewhere)
+    curl_auth_mode = "auto",       -- only when webdav_browser_curl.cfg can't be written: "auto" | "arg" | "stdin" (auto = arg on Windows, stdin elsewhere)
 
     -- ===== Buffering / prefetch =====
     demuxer_readahead_secs    = 300,  -- Seconds of media mpv tries to buffer ahead of the playback position
@@ -239,8 +356,18 @@ local function normalize_into(tbl)
     if tbl.pass == "" and os.getenv("WEBDAV_PASS") then tbl.pass = os.getenv("WEBDAV_PASS") end
     tbl.url = (tbl.url:gsub("/+$", ""))
 end
+-- the whole cleanup, for the options at the start and for a re-read of the .conf (the two must agree, or an old
+-- option name's value is undone at the first poll)
+function U.normalize_all(tbl)
+    normalize_into(tbl)
+    -- old option names: a value that differs from the old default wins (experimental_clean_titles=no -> clean_titles=no)
+    if tbl.experimental_clean_titles == false then tbl.clean_titles = false end
+    if tbl.experimental_posters == false then tbl.poster_column = false end
+    if tbl.experimental_animations == true then tbl.animations = true end
+    if tbl.experimental_merge_by_tmdb == true then tbl.merge_by_tmdb = true end
+end
 local function normalize_options()
-    normalize_into(o)
+    U.normalize_all(o)
     host_label = o.url:match("^https?://([^/]+)") or (o.url ~= "" and o.url or "not configured")
 end
 
@@ -278,7 +405,7 @@ function U.lenient_conf(tbl)
                 local def = DEFAULTS[k]
                 if def == nil then
                     unknown[#unknown + 1] = k
-                elseif k == "user" or k == "pass" then
+                elseif k == "user" or k == "pass" or k == "aiostreams_password" then
                     tbl[k] = v
                     if v:find("%s#") then
                         notes[#notes + 1] = k .. " contains ' #' - kept as part of the value (put comments on their own line)"
@@ -330,26 +457,81 @@ end
 -- ============================================================
 -- THEME (built from options)
 -- ============================================================
+-- ============================================================
+-- THEMES: theme= picks one of these; any color_* you set in the conf still wins over it
+-- ============================================================
+local PAL = {}            -- the palettes (one table: the main chunk is close to Lua's 200-locals limit)
+PAL.ui = {
+    -- the original "Sakura Night": plum dark, pink accent
+    classic  = { bg_dim = "08050F", bg_header = "100C18", bg_panel = "221A2F", bg_panel_dim = "1A1425", accent = "FF8FB8",
+                 border_unfocus = "3A2D4F", text_primary = "FAF5FF", text_muted = "B2A8C6", text_dim = "867C9A", good = "7FE3B0",
+                 warn = "FFB86B", bad = "FF6B8B", folder = "FFD6A5", video = "8EC5FF", audio = "C9A7FF", file = "A59BB8",
+                 cached = "9C92B0", track = "3B2F52", grad_top = "FF9CC2", grad_mid = "2B2140", grad_bottom = "B79CFF", star = "FFB86B" },
+    -- cool slate with an ice-blue accent
+    graphite = { bg_dim = "0B0D12", bg_header = "11141B", bg_panel = "1A1E27", bg_panel_dim = "14171F", accent = "7CC4FF",
+                 border_unfocus = "2A303C", text_primary = "F2F4F8", text_muted = "A6ADBB", text_dim = "6E7685", good = "5BD6A0",
+                 warn = "F5C451", bad = "FF6B6B", folder = "E8D3A8", video = "8EC5FF", audio = "B9A7FF", file = "9AA2B1",
+                 cached = "8C93A1", track = "2A303C", grad_top = "7CC4FF", grad_mid = "1C222D", grad_bottom = "9AA9FF", star = "F5C451" },
+    -- near-black with Netflix red
+    netflix  = { bg_dim = "0B0B0B", bg_header = "141414", bg_panel = "1F1F1F", bg_panel_dim = "181818", accent = "E50914",
+                 border_unfocus = "333333", text_primary = "FFFFFF", text_muted = "B3B3B3", text_dim = "808080", good = "46D369",
+                 warn = "F5B342", bad = "FF4D4F", folder = "E5E5E5", video = "E5E5E5", audio = "E5E5E5", file = "A0A0A0",
+                 cached = "8C8C8C", track = "3A3A3A", grad_top = "E50914", grad_mid = "1A1A1A", grad_bottom = "B20710", star = "E50914" },
+    -- muted rose on a warm dark
+    rose     = { bg_dim = "120B0E", bg_header = "1A1115", bg_panel = "2A1C22", bg_panel_dim = "21161B", accent = "E8A0B4",
+                 border_unfocus = "3D2A32", text_primary = "F7EEF1", text_muted = "C4AFB7", text_dim = "8E7880", good = "8FD9B6",
+                 warn = "F2C28B", bad = "F07A8E", folder = "F2D0B8", video = "B8C8F0", audio = "D6B2E8", file = "AE9AA2",
+                 cached = "A08C94", track = "3D2A32", grad_top = "E8A0B4", grad_mid = "2A1C22", grad_bottom = "C8A2D8", star = "F2C28B" },
+    -- true black, iOS greys and system colours
+    ios      = { bg_dim = "000000", bg_header = "0E0E10", bg_panel = "1C1C1E", bg_panel_dim = "141416", accent = "0A84FF",
+                 border_unfocus = "2C2C2E", text_primary = "FFFFFF", text_muted = "AEAEB2", text_dim = "8E8E93", good = "30D158",
+                 warn = "FFD60A", bad = "FF453A", folder = "FF9F0A", video = "64D2FF", audio = "BF5AF2", file = "8E8E93",
+                 cached = "98989D", track = "3A3A3C", grad_top = "0A84FF", grad_mid = "1C1C1E", grad_bottom = "5E5CE6", star = "FFD60A" },
+}
+-- the glass toasts / cards (toast_theme=): their tinted glass, edge, text and dot colours
+PAL.toast = {
+    classic  = { ring = "FFFFFF", fill = "0C0C12", edge = "FFFFFF", text = "FFFFFF", accent = "FF8FB8", good = "7FE3B0", warn = "FFB86B", bad = "FF6B8B" },
+    graphite = { ring = "7CC4FF", fill = "0E1117", edge = "DCE6F5", text = "F2F4F8", accent = "7CC4FF", good = "5BD6A0", warn = "F5C451", bad = "FF6B6B" },
+    netflix  = { ring = "E50914", fill = "0A0A0A", edge = "FFFFFF", text = "FFFFFF", accent = "E50914", good = "46D369", warn = "F5B342", bad = "FF4D4F" },
+    rose     = { ring = "E8A0B4", fill = "160D11", edge = "FFE4EC", text = "F7EEF1", accent = "E8A0B4", good = "8FD9B6", warn = "F2C28B", bad = "F07A8E" },
+    ios      = { ring = "0A84FF", fill = "1C1C1E", edge = "FFFFFF", text = "FFFFFF", accent = "0A84FF", good = "30D158", warn = "FFD60A", bad = "FF453A" },
+}
+function PAL.pick(list, name)
+    return list[tostring(name or ""):lower():gsub("%s+", "")] or list.classic
+end
+function PAL.build_toast()
+    local P = PAL.pick(PAL.toast, o.toast_theme)
+    return { ring = U.pick(o.toast_color_ring, P.ring), fill = U.pick(o.toast_color_fill, P.fill), edge = U.pick(o.toast_color_edge, P.edge), text = U.pick(o.toast_color_text, P.text),
+             accent = U.pick(o.toast_color_accent, P.accent), good = U.pick(o.toast_color_good, P.good),
+             warn = U.pick(o.toast_color_warn, P.warn), bad = U.pick(o.toast_color_bad, P.bad) }
+end
+local TOAST = PAL.build_toast()
+
 local function build_theme()
+    local P = PAL.pick(PAL.ui, o.theme)
     return {
-        bg_dim         = U.pick(o.color_bg_dim, "08050F"),
-        bg_header      = U.pick(o.color_bg_header, "100C18"),
-        bg_panel       = U.pick(o.color_bg_panel, "221A2F"),
-        bg_panel_dim   = U.pick(o.color_bg_panel_dim, "1A1425"),
-        accent         = U.pick(o.color_accent, "FF8FB8"),
-        border_unfocus = U.pick(o.color_border_unfocus, "3A2D4F"),
-        text_primary   = U.pick(o.color_text_primary, "FAF5FF"),
-        text_muted     = U.pick(o.color_text_muted, "B2A8C6"),
-        text_dim       = U.pick(o.color_text_dim, "867C9A"),
-        good           = U.pick(o.color_good, "7FE3B0"),
-        warn           = U.pick(o.color_warn, "FFB86B"),
-        bad            = U.pick(o.color_bad, "FF6B8B"),
-        folder         = U.pick(o.color_folder, "FFD6A5"),
-        video          = U.pick(o.color_video, "8EC5FF"),
-        audio          = U.pick(o.color_audio, "C9A7FF"),
-        file           = U.pick(o.color_file, "A59BB8"),
-        cached         = U.pick(o.color_cached_folder, "9C92B0"),
-        track          = U.pick(o.color_track, "3B2F52"),
+        bg_dim         = U.pick(o.color_bg_dim, P.bg_dim),
+        bg_header      = U.pick(o.color_bg_header, P.bg_header),
+        bg_panel       = U.pick(o.color_bg_panel, P.bg_panel),
+        bg_panel_dim   = U.pick(o.color_bg_panel_dim, P.bg_panel_dim),
+        accent         = U.pick(o.color_accent, P.accent),
+        border_unfocus = U.pick(o.color_border_unfocus, P.border_unfocus),
+        text_primary   = U.pick(o.color_text_primary, P.text_primary),
+        text_muted     = U.pick(o.color_text_muted, P.text_muted),
+        text_dim       = U.pick(o.color_text_dim, P.text_dim),
+        good           = U.pick(o.color_good, P.good),
+        warn           = U.pick(o.color_warn, P.warn),
+        bad            = U.pick(o.color_bad, P.bad),
+        folder         = U.pick(o.color_folder, P.folder),
+        video          = U.pick(o.color_video, P.video),
+        audio          = U.pick(o.color_audio, P.audio),
+        file           = U.pick(o.color_file, P.file),
+        cached         = U.pick(o.color_cached_folder, P.cached),
+        track          = U.pick(o.color_track, P.track),
+        grad_top       = U.pick(o.color_border_grad_top, P.grad_top),
+        grad_mid       = U.pick(o.color_border_grad_mid, P.grad_mid),
+        grad_bottom    = U.pick(o.color_border_grad_bottom, P.grad_bottom),
+        star           = U.pick(o.color_star, P.star),
     }
 end
 local THEME = build_theme()
@@ -445,8 +627,27 @@ local search_results = {}                     -- global (index) search results
 -- Mouse + overlay state kept in one table (Lua 5.1 allows only 200 local variables per function)
 local MS = { drag = nil, hover_sb = nil, last_down_t = 0, last_panel = nil, last_index = nil,
              last_double_t = 0, last_move_render = 0, debug = false, last_overlay_key = nil,
-             tooltip_x = 0, tooltip_y = 0, inflight = {} }
+             tooltip_x = 0, tooltip_y = 0, inflight = {}, hints = {}, rev = 0 }
 local CW_HREF = "webdav-browser://continue-watching"
+-- Properties the timers and cards look at, kept up to date by mpv instead of asked for: a direct read waits whenever
+-- mpv's core is busy (opening a stream, a slow seek), and every timer that asks would wait with it.
+MS.P = {}
+for _, n in ipairs({ "idle-active", "path", "focused", "window-minimized", "current-vo", "glsl-shaders", "video-params", "chapter-list",
+                     "playlist-pos", "playlist" }) do
+    mp.observe_property(n, "native", function(_, v) MS.P[n] = v end)
+end
+-- the cached value (asked for once while the first answer has not arrived yet; a property this mpv does not have is
+-- not asked for again)
+MS.Pq = {}
+function MS.prop(n)
+    local v = MS.P[n]
+    if v == nil and not MS.Pq[n] then
+        MS.Pq[n] = true
+        v = mp.get_property_native(n)
+        if MS.P[n] == nil then MS.P[n] = v end
+    end
+    return v
+end
 
 local watch_history, watched_set = {}, {}
 local pending_meta, now_playing = {}, nil
@@ -625,20 +826,10 @@ function U.utf8_sub(s, max_chars)
     return table.concat(out)
 end
 
--- Removes the last UTF-8 CHARACTER (not just the last byte) so Backspace never leaves half a glyph.
-function U.utf8_pop(s)
-    if s == "" then return s end
-    local i = #s
-    while i > 1 do
-        local b = s:byte(i)
-        if b < 128 or b >= 192 then break end   -- stop on an ASCII or lead byte
-        i = i - 1
-    end
-    return s:sub(1, i - 1)
-end
 
--- Natural ordering: "ep2" < "ep10", case-insensitive.
-function U.natural_less(a, b)
+-- Natural ordering: "ep2" < "ep10", case-insensitive. This is the direct comparison; U.natural_less (below) gives the
+-- same answer from cached sort keys.
+function U.natural_less0(a, b)
     a, b = a:lower(), b:lower()
     local i, j = 1, 1
     local la, lb = #a, #b
@@ -656,6 +847,38 @@ function U.natural_less(a, b)
         end
     end
     return (la - i) < (lb - j)
+end
+
+-- A sort key giving natural_less's order with a plain string comparison (a big list then sorts without calling
+-- natural_less for every pair). Lower-cased, and each digit run becomes <2-digit length of its value><the value
+-- without leading zeros><count of leading zeros>: a longer value sorts later, an equal value with fewer zeros
+-- first, and a run still starts with a digit, so digits against letters compare as before. false when a run has
+-- more than 15 significant digits or 9 leading zeros (natural_less compares those through tonumber): the caller
+-- then compares that name with natural_less.
+function U.natural_key(s)
+    local exact = true
+    local key = s:lower():gsub("%d+", function(d)
+        local v = d:match("^0*(%d*)$")
+        if #v > 15 or #d - #v > 9 then exact = false end
+        return string.format("%02d%s%d", #v, v, #d - #v)
+    end)
+    return exact and key
+end
+-- Sorting a big folder compares the same names thousands of times: each name's key is made ONCE and kept (a bounded
+-- cache, emptied when it gets big). A name without a key (false) is compared with natural_less0.
+U.NK, U.NKn = {}, 0
+function U.nat_key(s)
+    local k = U.NK[s]
+    if k ~= nil then return k end
+    k = U.natural_key(s)
+    if U.NKn > 40000 then U.NK, U.NKn = {}, 0 end
+    U.NK[s], U.NKn = k, U.NKn + 1
+    return k
+end
+function U.natural_less(a, b)
+    local ka, kb = U.nat_key(a), U.nat_key(b)
+    if ka and kb then return ka < kb end
+    return U.natural_less0(a, b)
 end
 
 -- Search normalisation: release names use dots/underscores/dashes as word separators.
@@ -678,6 +901,13 @@ function U.match_score(name, toks)
         if hay:sub(pos - 1, pos - 1) == " " then score = score + 3 else score = score + 1 end
     end
     return score
+end
+-- match_score's yes/no for text that already went through norm_text (for callers that keep it)
+function U.match_norm(hay, toks)
+    for _, tok in ipairs(toks) do
+        if not hay:find(tok, 1, true) then return false end
+    end
+    return true
 end
 
 function U.fmt_time(sec)
@@ -706,7 +936,10 @@ end
 function U.now_s() return mp.get_time() end
 
 function U.ass_escape(s)
-    return (tostring(s):gsub("\\", "\\\\"):gsub("{", "\\{"):gsub("}", "\\}"))
+    -- a raw line break would end the ASS event and spill the rest on screen as a giant unstyled line
+    -- a backslash is followed by an invisible zero-width character (as mpv's own OSC does): doubling it showed both
+    -- ("C:\\Users\\..."), a single one could start an ASS tag ("\N")
+    return (tostring(s):gsub("[\r\n]+", " "):gsub("\\", "\\\239\187\191"):gsub("{", "\\{"):gsub("}", "\\}"))
 end
 
 function U.fit_text(s, max_px, fs)
@@ -715,14 +948,26 @@ function U.fit_text(s, max_px, fs)
     return U.utf8_sub(s, math.max(1, max_chars - 1))
 end
 
+-- sizes and speeds: one decimal below 10 (3.4 MB, 8.1 GB), whole numbers above (31 MB), KB for small amounts
 function U.fmt_bytes(n)
+    n = tonumber(n) or 0
     if n >= 1073741824 then return string.format("%.1f GB", n / 1073741824) end
-    return string.format("%.0f MB", n / 1048576)
+    if n >= 10485760 then return string.format("%.0f MB", n / 1048576) end
+    if n >= 1048576 then return string.format("%.1f MB", n / 1048576) end
+    return string.format("%.0f KB", n / 1024)
 end
 
+-- The window size comes from a property observer (cached), never a synchronous read: right after a burst of overlay
+-- commands a synchronous read waits for mpv to finish drawing, which made every key press stall for a frame or more.
+U.osd_w, U.osd_h = 0, 0
+mp.observe_property("osd-dimensions", "native", function(_, v)
+    if type(v) == "table" then U.osd_w, U.osd_h = tonumber(v.w) or 0, tonumber(v.h) or 0 end
+end)
 function U.canvas_size()
-    local w = mp.get_property_number("osd-width") or 0
-    local h = mp.get_property_number("osd-height") or 0
+    local w, h = U.osd_w, U.osd_h
+    if w >= 64 and h >= 64 then return math.floor(w), math.floor(h) end
+    w = mp.get_property_number("osd-width") or 0
+    h = mp.get_property_number("osd-height") or 0
     if w < 64 or h < 64 then
         local ow, oh = mp.get_osd_size()
         w, h = ow or 0, oh or 0
@@ -743,10 +988,11 @@ local index_meta = { last_full = nil } -- when the library index was last crawle
 -- mpv's scripts/ folder), which silently disabled every save in earlier versions. Fall back to
 -- <mpv config dir>/script-opts/, which exists for anyone who has a .conf file.
 local function data_dir()
+    if MS.ddir then return MS.ddir end           -- looked up once (each lookup is a round trip to mpv)
     local d = mp.get_script_directory()
-    if d and d ~= "" then return d end
+    if d and d ~= "" then MS.ddir = d; return d end
     local ok, r = pcall(mp.command_native, { "expand-path", "~~/script-opts" })
-    if ok and type(r) == "string" and r ~= "" then return r end
+    if ok and type(r) == "string" and r ~= "" then MS.ddir = r; return r end
     if mp.find_config_file then
         local ok2, r2 = pcall(mp.find_config_file, "script-opts")
         if ok2 and type(r2) == "string" and r2 ~= "" then return r2 end
@@ -838,6 +1084,77 @@ local function safe_json(payload)
     return nil
 end
 
+-- ---------- journaled JSON files ----------
+-- Big caches (folder listings, TMDB matches, season data) used to be rewritten as a whole after every change, which
+-- with a large library is a noticeable hitch. Now a change appends one line {"k": key, "v": value} to "<file>.log"
+-- (no "v" = deleted); the full file is only rewritten ("compacted") when the log gets long, or at load time.
+-- Changes are found by comparing a cheap per-entry signature (table identity + a touch counter), not the content.
+function U.jl_apply(path, map)
+    local f = io.open(path .. ".log", "rb")
+    if not f then return 0 end
+    local n = 0
+    for line in f:lines() do
+        local ok, rec = pcall(utils.parse_json, line)
+        if ok and type(rec) == "table" and rec.k ~= nil then
+            map[rec.k] = rec.v
+            n = n + 1
+        end
+    end
+    f:close()
+    return n
+end
+function U.jl_sig(v)
+    if type(v) ~= "table" then return tostring(v) end
+    return tostring(v) .. "|" .. tostring(v._t or 0)
+end
+-- state = { sig = {}, lines = 0 }; returns true when only the log was written
+function U.jl_sync(state, path, map)
+    state.sig = state.sig or {}
+    local out = {}
+    for k, v in pairs(map) do
+        local s = U.jl_sig(v)
+        if state.sig[k] ~= s then
+            local line = safe_json({ k = k, v = v })
+            if line then out[#out + 1] = line end
+            state.sig[k] = s
+        end
+    end
+    for k in pairs(state.sig) do
+        if map[k] == nil then
+            out[#out + 1] = safe_json({ k = k })
+            state.sig[k] = nil
+        end
+    end
+    if #out == 0 then return true end
+    local f = io.open(path .. ".log", "ab")
+    if not f then return false end
+    f:write(table.concat(out, "\n") .. "\n")
+    f:close()
+    state.lines = (state.lines or 0) + #out
+    return true
+end
+U.JL_MAX, U.JL_FOLD = 4000, 300
+-- at quit / idle: a log of a few hundred lines, or half the size of its file, is folded into the file (loading is
+-- faster next time)
+function U.jl_fold(state, path, payload, map)
+    if type(state) ~= "table" or not path or (state.lines or 0) == 0 then return end
+    local big = (state.lines or 0) >= U.JL_FOLD
+    if not big then
+        local li, fi = utils.file_info(path .. ".log"), utils.file_info(path)
+        big = li ~= nil and (not fi or li.size > fi.size / 2)
+    end
+    if big then pcall(U.jl_compact, state, path, payload, map) end
+end
+-- rewrites the full file and drops the log
+function U.jl_compact(state, path, payload, map)
+    local txt = safe_json(payload)
+    if not txt or not atomic_write(path, txt) then return false end
+    pcall(os.remove, path .. ".log")
+    state.sig, state.lines = {}, 0
+    for k, v in pairs(map) do state.sig[k] = U.jl_sig(v) end
+    return true
+end
+
 -- Folder listings live in their own file (dirs.json, shared with the poster edition), so saving them never
 -- rewrites the watch history, and the history file stays small.
 function MS.cache_dir()
@@ -877,16 +1194,33 @@ local function load_persistence()
         index_meta    = U.plain(data.index)
         MS.hints      = U.plain(data.hints)
         MS.tracks     = U.plain(data.tracks)
+        MS.tracked    = U.plain(data.tracked)    -- the poster edition's tracked shows (kept by both editions)
         MS.rev        = tonumber(data.rev) or 0
+        MS.disk_mark(path)
     end
     if o.persist_dir_cache then
-        local cp = dircache_path()
-        local c = cp and try_load_json(cp)
-        if type(c) == "table" and type(c.dir_cache) == "table" then dir_cache = U.plain(c.dir_cache)
-        elseif data and type(data.dir_cache) == "table" then dir_cache = U.plain(data.dir_cache) end   -- older versions kept it in the history file
-        MS.cache_version = MS.cache_version + 1
+        -- the folder cache (it can be a few MB) is read just after mpv has finished loading the scripts, not while
+        -- mpv waits for them - or on first use, should anything ask for it sooner (an event queued at startup)
+        MS.dirs_old = data and type(data.dir_cache) == "table" and data.dir_cache or nil   -- older versions kept it in the history file
+        MS.dirs_pending = true
+        mp.add_timeout(0, function() MS.load_dirs() end)
     end
     persist_status.ok = true
+end
+function MS.load_dirs()
+    if not MS.dirs_pending then return end
+    MS.dirs_pending = nil
+    local old = MS.dirs_old
+    MS.dirs_old = nil
+    if MS.dcj then return end
+    local cp = dircache_path()
+    local c = cp and try_load_json(cp)
+    if type(c) == "table" and type(c.dir_cache) == "table" then dir_cache = U.plain(c.dir_cache)
+    elseif old then dir_cache = U.plain(old) end
+    MS.dcj = { sig = {}, lines = 0 }
+    if cp then MS.dcj.lines = U.jl_apply(cp, dir_cache) end
+    for k, v in pairs(dir_cache) do MS.dcj.sig[k] = U.jl_sig(v) end
+    MS.cache_version = MS.cache_version + 1
 end
 
 -- History file: small, written often, only ever by the instance that owns playback (MS.active).
@@ -896,7 +1230,7 @@ save_persistence = function(force)
     if not path then return end
     MS.rev = (MS.rev or 0) + 1
     local json = safe_json({ v = 3, rev = MS.rev, history = watch_history, watched = watched_set, sort = sort_by_dir,
-        index = index_meta, hints = MS.hints, tracks = MS.tracks })
+        index = index_meta, hints = MS.hints, tracks = MS.tracks, tracked = MS.tracked })
     if not json then
         persist_status.ok, persist_status.err = false, "format_json failed"
         return
@@ -905,23 +1239,52 @@ save_persistence = function(force)
     persist_status.path = path
     persist_status.ok = wok
     persist_status.err = wok and nil or werr
-    if wok then persist_status.last_save, persist_status.bytes = os.time(), #json
+    if wok then
+        persist_status.last_save, persist_status.bytes = os.time(), #json
+        MS.prog_dirty = false
+        MS.disk_mark(path)
     else msg.warn("webdav-browser: could not save data: " .. tostring(werr)) end
 end
+-- what the history file looked like when this script last read or wrote it: unchanged on disk = nothing to re-read
+function MS.disk_mark(path)
+    local i = path and utils.file_info(path)
+    MS.disk_sig = i and (tostring(i.size) .. "|" .. tostring(i.mtime)) or nil
+end
+function MS.disk_same(path)
+    local i = path and utils.file_info(path)
+    return i ~= nil and MS.disk_sig ~= nil and MS.disk_sig == (tostring(i.size) .. "|" .. tostring(i.mtime))
+end
 
+-- the long folder-listing log folded into dirs.json: at quit, and while mpv sits idle with the browser closed
+function MS.fold_journals()
+    if MS.active == false then return end
+    if o.persist_dir_cache and MS.dcj then U.jl_fold(MS.dcj, dircache_path(), { v = 1, dir_cache = dir_cache }, dir_cache) end
+end
+mp.add_periodic_timer(60, function()
+    if not browser_active and MS.P["idle-active"] then MS.fold_journals() end
+end)
 local function save_dircache()
     if not o.persist_dir_cache or MS.active == false then return end
     local cp = dircache_path()
     if not cp then return end
-    local json = safe_json({ v = 1, dir_cache = dir_cache })
-    if not json then return end
-    local ok = atomic_write(cp, json)
+    if MS.dirs_pending then return end          -- not read yet: nothing of it may be written over
+    MS.dcj = MS.dcj or { sig = {}, lines = 1e9 }
+    -- changed listings are appended to the log; the file itself is rewritten when mpv quits or sits idle (U.jl_fold),
+    -- or straight away only when the log has grown very long
+    local ok
+    if MS.dcj.lines < U.JL_MAX and utils.file_info(cp) then ok = U.jl_sync(MS.dcj, cp, dir_cache) end
     if not ok then
-        -- the cache folder may not exist yet
-        MS.mkdir()
-        ok = atomic_write(cp, json)
+        ok = U.jl_compact(MS.dcj, cp, { v = 1, dir_cache = dir_cache }, dir_cache)
+        if not ok then
+            MS.mkdir()          -- the cache folder may not exist yet
+            ok = U.jl_compact(MS.dcj, cp, { v = 1, dir_cache = dir_cache }, dir_cache)
+        end
     end
-    if ok then MS.cache_dirty = false; persist_status.cache_bytes = #json end
+    if ok then
+        MS.cache_dirty = false
+        local a, b = utils.file_info(cp), utils.file_info(cp .. ".log")
+        persist_status.cache_bytes = (a and a.size or 0) + (b and b.size or 0)
+    end
 end
 
 -- Directory-cache writes are batched: the first dirty change schedules ONE flush; further changes
@@ -979,15 +1342,7 @@ local function run_curl_async(args, callback)
         "--connect-timeout", tostring(math.min(10, o.request_timeout)),
         "-w", "\\n%{http_code}",
     }
-    local stdin_data = nil
-    if o.user ~= "" or o.pass ~= "" then
-        if U.auth_mode() == "arg" then
-            table.insert(full_args, "-u"); table.insert(full_args, o.user .. ":" .. o.pass)
-        else
-            table.insert(full_args, "-K"); table.insert(full_args, "-")
-            stdin_data = "user = " .. U.curl_quote(o.user .. ":" .. o.pass) .. "\n"
-        end
-    end
+    local stdin_data = U.curl_auth(full_args)
     for _, a in ipairs(args) do table.insert(full_args, a) end
 
     local t0 = U.now_s()
@@ -1033,6 +1388,34 @@ local function sort_entries(list, mode)
     end)
 end
 
+-- an href without the WebDAV address's own path (compared segment by segment, %-decoded)
+function U.dav_rel(p)
+    local base = tostring(o.url or ""):match("^https?://[^/]+(/.-)/*$")
+    if not base or base == "" or base == "/" then return p end
+    local pos = 1
+    for seg in base:gmatch("[^/]+") do
+        local s1, e1 = p:find("[^/]+", pos)
+        if not s1 or U.percent_decode(p:sub(s1, e1)) ~= U.percent_decode(seg) then return p end
+        pos = e1 + 1
+    end
+    local rest = p:sub(pos)
+    return (rest == "") and "/" or rest
+end
+-- The WebDAV login for curl, in webdav_browser_curl.cfg next to the data file (-K): never in mpv's log
+function U.curl_auth(args)
+    if o.user == "" and o.pass == "" then return nil end
+    local body = "user = " .. U.curl_quote(o.user .. ":" .. o.pass) .. "\n"
+    local dir = data_dir()
+    local p = dir and utils.join_path(dir, "webdav_browser_curl.cfg")
+    if p and (U.auth_body ~= body or not utils.file_info(p)) then
+        local f = io.open(p, "wb")
+        if f then f:write(body); f:close(); U.auth_body = body else p = nil end
+    end
+    if p then args[#args + 1] = "-K"; args[#args + 1] = p; return nil end
+    if U.auth_mode() == "arg" then args[#args + 1] = "-u"; args[#args + 1] = o.user .. ":" .. o.pass; return nil end
+    args[#args + 1] = "-K"; args[#args + 1] = "-"
+    return body
+end
 local function parse_propfind(xml, request_path)
     local results, seen = {}, {}
     if not xml then return results end
@@ -1040,8 +1423,8 @@ local function parse_propfind(xml, request_path)
         local href = block:match("<[^>]-:?href[^>]*>(.-)</[^>]-:?href>")
         if href then
             href = U.xml_unescape(href)
-            local path_only = href:gsub("^https?://[^/]+", "")
-            local is_collection = block:match("<[^>]-:?collection%s*/?>") ~= nil
+            local path_only = U.dav_rel(href:gsub("^https?://[^/]+", ""))
+            local is_collection = block:match("<[^>/]-:?collection[%s/>]") ~= nil
             local norm_req  = request_path:gsub("/+$", "")
             local norm_href = path_only:gsub("/+$", "")
             if norm_href ~= norm_req then
@@ -1107,7 +1490,8 @@ local function fetch_dir_async(path, callback)
                 req_stats.failures = req_stats.failures + 1
                 callback(nil, problem, info)
             else
-                callback(parse_propfind(stdout, path), nil, info)
+                local okp, entries = pcall(parse_propfind, stdout, path)
+                if okp then callback(entries, nil, info) else callback(nil, "Unreadable answer from the server", info) end
             end
         end)
     end
@@ -1121,6 +1505,7 @@ function U.with_slash(href) return (href:gsub("/+$", "")) .. "/" end
 
 -- cached listing for a directory, tolerant of a missing/extra trailing slash
 local function find_cached_dir(href)
+    if MS.dirs_pending then MS.load_dirs() end
     return dir_cache[href] or dir_cache[U.with_slash(href)] or dir_cache[(href:gsub("/+$", ""))]
 end
 
@@ -1150,25 +1535,58 @@ local function drop_cached_prefix(href)
     end
 end
 
+-- the same entries (names, sizes, dates), in any order
+function U.same_listing(a, b)
+    if #a ~= #b then return false end
+    local by = {}
+    for _, e in ipairs(a) do by[e.href] = e end
+    for _, e in ipairs(b) do
+        local x = by[e.href]
+        if not x or x.name ~= e.name or x.is_dir ~= e.is_dir or x.size ~= e.size or x.mtime ~= e.mtime then return false end
+    end
+    return true
+end
+-- Continue Watching only looks inside folders that hold a file you watched or left part-way
+function U.cw_touches(list)
+    if type(list) ~= "table" then return false end
+    for _, e in ipairs(list) do
+        if not e.is_dir and (watched_set[e.href] or watch_history[e.href]) then return true end
+    end
+    return false
+end
+
 -- Stores a freshly fetched listing. Sub-folders that existed in the previous listing but are gone
 -- now are pruned (tree nodes AND their cached listings), so deleted folders no longer linger in the
 -- tree, in folder search, or in the library index.
+-- Returns the entries to use (the stored table when nothing changed) and whether anything changed.
 local function store_listing(href, entries)
     local old = dir_cache[href]
-    if old and type(old.entries) == "table" then
-        local still = {}
-        for _, e in ipairs(entries) do if e.is_dir then still[e.href] = true end end
-        for _, e in ipairs(old.entries) do
-            if e.is_dir and not still[e.href] then
-                prune_tree(e.href)
-                drop_cached_prefix(e.href)
-                dir_cache[e.href] = nil
+    local same = old and type(old.entries) == "table" and U.same_listing(old.entries, entries)
+    if same then
+        -- the same listing again (a re-check, a revalidation): the stored table is kept, so nothing keyed on it
+        -- (the search list, Continue Watching, the journal) sees a change - only its age is renewed
+        entries = old.entries
+        if os.time() - (old.ts or 0) > 300 or old.stale then old._t = (old._t or 0) + 1 end    -- its new age reaches the journal now and then
+        old.ts, old.stale = os.time(), nil
+    else
+        local pruned = false
+        if old and type(old.entries) == "table" then
+            local still = {}
+            for _, e in ipairs(entries) do if e.is_dir then still[e.href] = true end end
+            for _, e in ipairs(old.entries) do
+                if e.is_dir and not still[e.href] then
+                    prune_tree(e.href)
+                    drop_cached_prefix(e.href)
+                    dir_cache[e.href] = nil
+                    pruned = true
+                end
             end
         end
+        dir_cache[href] = { entries = entries, ts = os.time() }
+        MS.cache_version = MS.cache_version + 1
+        -- (a dropped sub-folder's listing may be one Continue Watching used)
+        if pruned or U.cw_touches(old and old.entries) or U.cw_touches(entries) then mark_continue_dirty() end
     end
-    dir_cache[href] = { entries = entries, ts = os.time() }
-    MS.cache_version = MS.cache_version + 1
-    mark_continue_dirty()
     -- Real-Debrid fills a big torrent folder gradually (it prepares the links one by one): a listing that grew since
     -- the last look is "still filling" - it is re-checked every few seconds while you look at it and never counts
     -- as fresh in the cache until two checks in a row return the same number of entries.
@@ -1180,12 +1598,13 @@ local function store_listing(href, entries)
         dir_cache[href].stale = true
     elseif g then
         g.stable = g.stable + 1
-        if g.stable >= 2 then MS.grow[href] = nil else dir_cache[href].stale = true end
+        if g.stable >= 2 then MS.grow[href] = nil else dir_cache[href].stale = true; dir_cache[href]._t = (dir_cache[href]._t or 0) + 1 end
     end
     if href == current_path then
         if MS.grow[href] then status_line = string.format("Real-Debrid is still adding files to this folder…  %d so far", #entries)
         elseif g and status_line:find("still adding files", 1, true) then status_line = string.format("All %d entries listed", #entries) end
     end
+    return entries, not same
 end
 
 apply_dir_result = function(href, entries)
@@ -1242,14 +1661,20 @@ flatten_visible = function()
 end
 
 -- Folder-name search across the whole loaded tree (expanded or not); words match across . _ - separators.
+-- Each node keeps its normalised name and natural sort key (made once, again only if the name changed), so a
+-- keystroke or a redraw does not re-normalise the whole tree, and the sort compares plain strings.
 collect_matching_folders = function(query)
     local toks = U.query_tokens(query)
     local out = {}
     for _, node in pairs(tree) do
-        if U.match_score(node.name, toks) then table.insert(out, node) end
+        if node._nsrc ~= node.name then
+            node._nsrc, node._nn, node._nk = node.name, U.norm_text(node.name), U.natural_key(node.name)
+        end
+        if U.match_norm(node._nn, toks) then out[#out + 1] = node end
     end
     table.sort(out, function(a, b)
         if a.depth ~= b.depth then return a.depth < b.depth end
+        if a._nk and b._nk then return a._nk < b._nk end
         return U.natural_less(a.name, b.name)
     end)
     return out
@@ -1261,6 +1686,24 @@ end
 local function loading_delta(d)
     loading_count = math.max(0, loading_count + d)
     is_loading = loading_count > 0
+end
+
+-- Should a background (silent) listing redraw the browser right away? Never while it is closed. While the library
+-- crawl runs, only for what the listing visibly changes at once: the open folder, the root, or a folder row the
+-- Folders panel shows (all folders above it expanded). The crawl's spinner redraws twice a second anyway and picks
+-- up the rest (counts, a filtered folder list), so a crawl no longer redraws everything once per folder.
+function MS.listing_shown(href)
+    if not browser_active then return false end
+    if not MS.idx_running or href == current_path or href == root_href then return true end
+    local node, guard = tree[href], 0
+    while node and guard < 64 do
+        guard = guard + 1
+        local p = node.parent_href
+        if p == nil or p == root_href then return true end
+        node = tree[p]
+        if not (node and node.expanded) then return false end
+    end
+    return false
 end
 
 -- The ONE place a folder listing is fetched, stored and applied.
@@ -1311,14 +1754,18 @@ fetch_listing = function(href, opts, on_done)
         if err then
             listing_error[href] = err
             if not opts.silent or href == current_path then
-                status_line = "Failed: " .. err
+                status_line = "Couldn't load this folder: " .. err .. "  ·  " .. U.kname("refresh") .. " to retry"
             end
-            render()
+            if not opts.silent or MS.listing_shown(href) then render() end
             finish(false, err)
             return
         end
+        local st0, changed = status_line, listing_error[href] ~= nil      -- an error that clears is a change too
+        if changed and href == current_path and tostring(status_line):find("^Couldn't load") then status_line = "Ready" end
         listing_error[href] = nil
-        store_listing(href, entries)
+        local new
+        entries, new = store_listing(href, entries)
+        changed = changed or new
         -- Only build tree nodes for folders that are part of the tree already (or the root). The
         -- background index also fetches deep folders whose ancestors aren't loaded; creating nodes
         -- for those would leave orphans with wrong depths.
@@ -1336,7 +1783,8 @@ fetch_listing = function(href, opts, on_done)
             after_files_set()
         end
         if not opts.silent and opts.status and not MS.grow[href] then status_line = "Loaded: " .. (U.basename(href) ~= "" and U.basename(href) or "root") end
-        render()
+        -- a background listing that changed nothing (and left the status line alone) draws nothing
+        if not opts.silent or ((changed or status_line ~= st0) and MS.listing_shown(href)) then render() end
         -- during a library crawl write less often (every ~30 s): the data file holds the whole index
         debounced_save_persistence(opts.silent and (MS.idx_running and 30 or 8) or 3, "cache")
         finish(true)
@@ -1411,7 +1859,8 @@ local function refresh_many(hrefs, label, on_done)
         if idx > 0 and ok == false then failed = failed + 1 end
         idx = idx + 1
         if idx > total then
-            status_line = (failed > 0) and string.format("%s: done, %d failed", label, failed) or (label .. ": done")
+            status_line = (failed > 0) and (string.format("Couldn't load %d folder%s  ·  %s to retry", failed, failed == 1 and "" or "s", U.kname("refresh")))
+                or (label .. ": done")
             render()
             if on_done then on_done() end
             return
@@ -1469,7 +1918,7 @@ refresh_all = function()
     for _, h in ipairs(hrefs) do done[h] = true end
     refresh_many(hrefs, "Refreshing all", function()
         for h, c in pairs(dir_cache) do
-            if not done[h] then c.stale = true end
+            if not done[h] then c.stale = true; c._t = (c._t or 0) + 1 end
         end
         if o.index_enabled and o.index_mode == "full" then index_start(true) end
         debounced_save_persistence()
@@ -1567,7 +2016,12 @@ local function queue_many(items, mode)
     end
     local list = "memory://" .. table.concat(lines, "\n")
     local insert = mode:find("^insert%-next") ~= nil
-    -- mpv < 0.38 has no insert-next for loadlist: append instead (keeps the titles); asked once, then remembered
+    -- mpv < 0.38 has no insert-next for loadlist: append instead (keeps the titles). Known from mpv's version (asking
+    -- it first left an error line in the log on every older mpv), else asked once and remembered
+    if insert and MS.no_insert_next == nil then
+        local a, b = tostring(mp.get_property("mpv-version") or ""):match("(%d+)%.(%d+)")
+        if a and (tonumber(a) == 0 and tonumber(b) < 38) then MS.no_insert_next = true end
+    end
     if not (insert and MS.no_insert_next) then
         if mp.commandv("loadlist", list, mode) then return end
         if insert then MS.no_insert_next = true end
@@ -1597,6 +2051,7 @@ end
 -- ---------- Continue Watching (virtual list) ----------
 local cw_cache, cw_dirty = nil, true
 mark_continue_dirty = function() cw_dirty = true end
+MS.cw_sorted = setmetatable({}, { __mode = "k" })     -- a folder's media files in name order, per listing table
 
 -- Two kinds of rows: files you left part-way ("resume", newest first) and, per folder you have
 -- been watching, the first not-yet-watched file after the last one you finished ("next").
@@ -1608,7 +2063,7 @@ get_continue_list = function()
         if rec.pos and not watched_set[href] then
             table.insert(resume, {
                 name = rec.name or U.basename(href), href = href, is_dir = false, cw = "resume",
-                dirpath = rec.dirpath or U.dirname(href), ts = rec.last_played or 0,
+                dirpath = rec.dirpath or U.dirname(href), ts = rec.last_played or 0, pos = rec.pos,
             })
         end
     end
@@ -1622,12 +2077,22 @@ get_continue_list = function()
     end
     for d, ts in pairs(dirs) do
         local cached = find_cached_dir(d)
-        if cached and type(cached.entries) == "table" then
-            local media = {}
-            for _, e in ipairs(cached.entries) do
-                if not e.is_dir and U.is_media(e.name) then media[#media + 1] = e end
+        local hint = MS.hints and MS.hints[d]
+        if not (cached and type(cached.entries) == "table") and hint and hint.href
+           and not watched_set[hint.href] and not watch_history[hint.href] then
+            -- the listing is not cached (cache cleared, other edition): the next file noted when the last one was finished
+            table.insert(nxt, { name = hint.name or U.basename(hint.href), href = hint.href, is_dir = false,
+                size = hint.size, cw = "next", dirpath = d, ts = ts })
+        elseif cached and type(cached.entries) == "table" then
+            local media = MS.cw_sorted[cached.entries]
+            if not media then
+                media = {}
+                for _, e in ipairs(cached.entries) do
+                    if not e.is_dir and U.is_media(e.name) then media[#media + 1] = e end
+                end
+                table.sort(media, function(a, b) return U.natural_less(a.name, b.name) end)
+                MS.cw_sorted[cached.entries] = media
             end
-            table.sort(media, function(a, b) return U.natural_less(a.name, b.name) end)
             local last_watched = 0
             for i, e in ipairs(media) do if watched_set[e.href] then last_watched = i end end
             for i = last_watched + 1, #media do
@@ -1649,6 +2114,15 @@ get_continue_list = function()
     for _, e in ipairs(resume) do out[#out + 1] = e end
     for _, e in ipairs(nxt) do out[#out + 1] = e end
     while #out > o.continue_max_items do out[#out] = nil end
+    -- the same rows as before: the old list is kept, so nothing that keys on it sees a change
+    if cw_cache and #cw_cache == #out then
+        local same = true
+        for i, e in ipairs(out) do
+            local c = cw_cache[i]
+            if c.href ~= e.href or c.cw ~= e.cw or c.ts ~= e.ts or c.dirpath ~= e.dirpath or c.pos ~= e.pos then same = false break end
+        end
+        if same then cw_dirty = false; return cw_cache end
+    end
     cw_cache, cw_dirty = out, false
     return out
 end
@@ -1756,7 +2230,7 @@ play_entry = function(entry, append)
 
     queue_load(stream_url, "replace", entry.name)
     status_line = "Playing: " .. entry.name
-    if o.auto_close_on_play then close_pending_for = stream_url end
+    if o.auto_close_on_play then close_pending_for = stream_url; MS.close_t = mp.get_time() end
 end
 
 -- ============================================================
@@ -1819,6 +2293,7 @@ end
 
 function MS.fb_stop(delete_file)
     local fb = MS.fb
+    if MS.sc and not (MS.sc.spec and MS.sc.spec.err) then MS.sc.done("fb") end
     if fb.timer then fb.timer:kill() end
     if fb.cmd then
         fb.killed = true
@@ -1829,10 +2304,27 @@ function MS.fb_stop(delete_file)
     if delete_file and path and not o.fallback_keep then MS.fb_remove(path) end
 end
 
-function MS.fb_say(text)
-    mp.osd_message(text, 1.6)
+function MS.fb_say(text, spec)
     status_line = text
+    -- the glass status card when this edition has one (else mpv's plain on-screen message)
+    if MS.sc and spec then MS.sc.show(spec) elseif not MS.sc then mp.osd_message(text, 1.6) end
     if browser_active then render() end
+end
+-- "Show  ·  S01E03" (and the episode name) for the card, else the file name made readable
+function MS.fb_title(meta)
+    local em = MS.ep_meta and MS.ep_meta[meta.href]
+    if em and em.show then return em.show .. (em.label and ("  ·  " .. em.label) or ""), em.name end
+    local cp = MS.ct_parse and MS.ct_parse(tostring(meta.name or ""))
+    local sn, en = tostring(meta.name or ""):match("[Ss](%d%d?%d?)[ %._-]?[Ee](%d%d?%d?%d?)")
+    local tag = sn and string.format("S%02dE%02d", tonumber(sn), tonumber(en)) or (cp and (cp.se or cp.season))
+    if cp and cp.title then return cp.title .. (tag and ("  ·  " .. tag) or "") end
+    return (tostring(meta.name or ""):gsub("%.%w+$", ""):gsub("[%._]+", " "))
+end
+function MS.fb_spec(fb, over)
+    local title = MS.fb_title(fb.meta or {})
+    local sp = { owner = "fb", eyebrow = "DOWNLOAD & PLAY", title = title }
+    for k, v in pairs(over or {}) do sp[k] = v end
+    return sp
 end
 
 function MS.fb_play()
@@ -1842,8 +2334,26 @@ function MS.fb_play()
     fb.local_url = "ffmpeg://file:" .. fb.path
     pending_meta[fb.local_url] = fb.meta
     loading_meta = fb.meta
-    ensure_http_options(); mp.commandv("loadfile", fb.local_url, "replace")   -- local growing file: plain loadfile
-    if o.auto_close_on_play then close_pending_for = fb.local_url end
+    ensure_http_options()
+    -- played again after it ran dry: the same entry; after a failed stream: in its place (the queue stays); else replace
+    local pl = mp.get_property_native("playlist") or {}
+    for i, e in ipairs(pl) do
+        if e.filename == fb.local_url then mp.commandv("playlist-play-index", tostring(i - 1)); return end
+    end
+    if fb.pl_id then
+        for i, e in ipairs(pl) do
+            if e.id == fb.pl_id then
+                mp.commandv("loadfile", fb.local_url, "append")
+                local n = mp.get_property_number("playlist-count") or 0
+                mp.commandv("playlist-move", tostring(n - 1), tostring(i - 1))
+                mp.commandv("playlist-play-index", tostring(i - 1))
+                mp.commandv("playlist-remove", tostring(i))
+                return
+            end
+        end
+    end
+    mp.commandv("loadfile", fb.local_url, "replace")
+    if o.auto_close_on_play then close_pending_for = fb.local_url; MS.close_t = mp.get_time() end
 end
 
 function MS.fb_tick()
@@ -1861,11 +2371,13 @@ function MS.fb_tick()
     local pct = (total > 0) and math.floor(size / total * 100) or nil
     local label = string.format("%s%s of %s%s", U.fmt_bytes(size), pct and (" (" .. pct .. "%)") or "",
         total > 0 and U.fmt_bytes(total) or "?", speed > 0 and ("  " .. U.fmt_bytes(speed) .. "/s") or "")
+    local spd = speed > 0 and (U.fmt_bytes(speed) .. "/s") or "waiting for data"
 
     if fb.failed and not fb.playing then
         local why = tostring(fb.err or "unknown error"):gsub("%s+$", "")
+        local spec = MS.fb_spec(fb, { err = true, line = "Download failed: " .. why:gsub("%s+", " "):sub(1, 120), frac = 0, secs = 8 })
         MS.fb_stop(true)
-        MS.fb_say("Download failed: " .. why:sub(1, 120))
+        MS.fb_say("Download failed: " .. why:sub(1, 120), spec)
         return
     end
 
@@ -1873,10 +2385,16 @@ function MS.fb_tick()
         local need = math.floor((tonumber(o.fallback_start_mb) or 200) * 1048576)
         if total > 0 then need = math.min(need, total) end
         if size > 0 and (size >= need or fb.done) then
-            MS.fb_say("Download-play: starting (" .. label .. ")")
+            MS.fb_say("Download-play: starting (" .. label .. ")", MS.fb_spec(fb, { line = "Starting playback…", frac = 1 }))
             MS.fb_play()
+            if MS.sc then MS.sc.done("fb") end
         else
-            MS.fb_say(string.format("Download-play: buffering %s  -  starts at %d MB", label, math.floor(need / 1048576)))
+            local eta = (speed > 0) and string.format("  ·  ~%d s", math.ceil((need - size) / speed)) or ""
+            MS.fb_say(string.format("Download-play: buffering %s  -  starts at %d MB", label, math.floor(need / 1048576)),
+                MS.fb_spec(fb, { line = string.format("%s of %s  ·  %s%s", U.fmt_bytes(size), U.fmt_bytes(need), spd, eta),
+                    frac = (size > 0) and (size / math.max(1, need)) or nil,
+                    sub = string.format("Plays at %s%s  ·  keeps downloading while you watch", U.fmt_bytes(need),
+                        (fb.reason and fb.reason ~= "manual") and "  ·  streaming failed, so it downloads first" or "") }))
         end
         return
     end
@@ -1896,10 +2414,18 @@ function MS.fb_tick()
     elseif fb.failed then
         if not fb.fail_told then
             fb.fail_told = true
-            MS.fb_say("Download stopped (" .. tostring(fb.err or "error"):sub(1, 80) .. ") - playback may stall")
+            MS.fb_say("Download stopped (" .. tostring(fb.err or "error"):sub(1, 80) .. ") - playback may stall",
+                MS.fb_spec(fb, { err = true, line = "The download stopped: " .. tostring(fb.err or "error"):gsub("%s+", " "):sub(1, 90),
+                    sub = "Playback may stall once it reaches the end of what arrived", frac = pct and pct / 100 or 0, secs = 8 }))
         end
-    elseif mp.get_property_bool("core-idle") and speed >= 0 then
-        mp.osd_message("Waiting for download: " .. label, 1.2)
+    elseif mp.get_property_bool("core-idle") and not mp.get_property_bool("pause") then
+        -- the video caught up with the download: the card says how far along it is
+        if MS.sc then
+            MS.sc.show(MS.fb_spec(fb, { eyebrow = "WAITING FOR THE DOWNLOAD", line = string.format("%s of %s  ·  %s", U.fmt_bytes(size),
+                total > 0 and U.fmt_bytes(total) or "?", spd), frac = (total > 0) and (size / total) or nil }))
+        else mp.osd_message("Waiting for download: " .. label, 1.2) end
+    elseif MS.sc then
+        MS.sc.done("fb")
     end
 end
 
@@ -1919,15 +2445,7 @@ function MS.fb_start(meta, reason)
     local args = { o.curl_path, "-s", "-S", "-L", "--create-dirs", "-C", "-", "--retry", "30", "--retry-delay", "3",
         "--connect-timeout", "15", "-o", path }
     if o.user_agent ~= "" then args[#args + 1] = "-A"; args[#args + 1] = o.user_agent end
-    local stdin_data = nil
-    if o.user ~= "" or o.pass ~= "" then
-        if U.auth_mode() == "arg" then
-            args[#args + 1] = "-u"; args[#args + 1] = o.user .. ":" .. o.pass
-        else
-            args[#args + 1] = "-K"; args[#args + 1] = "-"
-            stdin_data = "user = " .. U.curl_quote(o.user .. ":" .. o.pass) .. "\n"
-        end
-    end
+    local stdin_data = U.curl_auth(args)
     args[#args + 1] = o.url .. meta.href
     fb.cmd = mp.command_native_async({
         name = "subprocess", args = args, stdin_data = stdin_data,
@@ -1944,7 +2462,7 @@ function MS.fb_start(meta, reason)
         end
     end)
     fb.timer = mp.add_periodic_timer(1, MS.fb_tick)
-    MS.fb_say("Download-play: starting download...")
+    MS.fb_say("Download-play: starting download...", MS.fb_spec(fb, { line = "Starting the download…" }))
     return true
 end
 
@@ -2221,7 +2739,7 @@ function IDX.count_items()
 end
 
 function IDX.finish(complete, reason)
-    IDX.running = false
+    IDX.running, IDX.held = false, false
     MS.idx_running = false
     MS.cache_version = MS.cache_version + 1      -- make sure the final index state is searchable
     IDX.last_stop = os.time()
@@ -2238,8 +2756,23 @@ function IDX.finish(complete, reason)
     end
 end
 
+-- Playback comes first: while a file plays with the browser closed the crawl waits (no requests, no data-file
+-- writes). It stops at the folder it would fetch next, so IDX.resume carries on exactly where it was.
+function IDX.must_wait()
+    return not browser_active and mp.get_property_native("idle-active") == false
+end
+
+-- Picks a waiting crawl up again (playback stopped, or the browser was opened).
+function IDX.resume()
+    if not (IDX.running and IDX.held) or IDX.must_wait() then return end
+    IDX.held = false
+    local gen = IDX.gen
+    mp.add_timeout(0.05, function() if IDX.gen == gen then IDX.step() end end)
+end
+
 function IDX.step()
     if not IDX.running then return end
+    if IDX.must_wait() then IDX.held = true; return end
     if IDX.head > #IDX.queue then IDX.finish(true); return end
     if IDX.scanned >= o.index_max_dirs then IDX.finish(false, "folder limit reached"); return end
     if IDX.consecutive_errors >= 5 then IDX.finish(false, "stopped after repeated errors"); return end
@@ -2253,7 +2786,8 @@ function IDX.step()
             if e.is_dir then IDX.queue[#IDX.queue + 1] = e.href end
         end
     end
-    local function next_step(delay) mp.add_timeout(delay, IDX.step) end
+    local gen = IDX.gen
+    local function next_step(delay) mp.add_timeout(delay, function() if IDX.gen == gen then IDX.step() end end) end
 
     local cached = dir_cache[href]
     local max_age = o.index_refresh_hours * 3600
@@ -2266,7 +2800,7 @@ function IDX.step()
     end
 
     fetch_listing(href, { silent = true }, function(ok)
-        if not IDX.running then return end
+        if not IDX.running or IDX.gen ~= gen then return end
         if ok then
             IDX.fetched = IDX.fetched + 1
             IDX.consecutive_errors = 0
@@ -2290,7 +2824,8 @@ index_start = function(force)
         if force then IDX.force = true end
         return
     end
-    IDX.running, IDX.force = true, force and true or false
+    IDX.running, IDX.force, IDX.held = true, force and true or false, false
+    IDX.gen = (IDX.gen or 0) + 1
     MS.idx_running = true
     IDX.queue, IDX.head = { root_href }, 1
     IDX.scanned, IDX.fetched, IDX.errors, IDX.consecutive_errors = 0, 0, 0, 0
@@ -2331,6 +2866,8 @@ function IDX.maybe_autostart()
         if o.index_enabled and not IDX.running then index_start(false) end
     end)
 end
+-- playback stopped (nothing loaded any more): a crawl that waited for it goes on
+mp.observe_property("idle-active", "bool", function(_, idle) if idle then IDX.resume() end end)
 
 -- ============================================================
 -- SEARCH
@@ -2344,21 +2881,78 @@ local function pad_digits(s)
     return (s:gsub("%d+", function(d) return (#d < 8) and (string.rep("0", 8 - #d) .. d) or d end))
 end
 
--- Flat, pre-sorted copy of every cached entry (normalised name + sort key). Built once per cache
--- change, so a keystroke is just a linear scan with no sorting.
+-- Order of the flat list: the sort key, then (only for equal keys) name, folder and href, so the order is the
+-- same however the list was put together (whole, or merged folder by folder).
+function MS.flat_less(a, b)
+    if a.key ~= b.key then return a.key < b.key end
+    local an, bn = a.e.name, b.e.name
+    if an ~= bn then return an < bn end
+    if a.dir ~= b.dir then return a.dir < b.dir end
+    return tostring(a.e.href) < tostring(b.e.href)
+end
+
+-- One folder's items for the flat list. `prev` is its previous record: names it had before keep their
+-- normalised text and key (a re-listed folder is mostly the same names), so only new names are normalised.
+function MS.flat_dir(dirhref, entries, prev)
+    local had = {}
+    if prev then for _, it in ipairs(prev.items) do had[it.e.name] = it end end
+    local items = {}
+    for i, e in ipairs(entries) do
+        local h = had[e.name]
+        local hay = h and h.hay or U.norm_text(e.name)
+        items[i] = { hay = hay, key = h and h.key or pad_digits(hay), e = e, dir = dirhref }
+    end
+    return { entries = entries, items = items }
+end
+
+-- Flat, pre-sorted copy of every cached entry (normalised name + sort key), so a keystroke is just a linear
+-- scan with no sorting. Kept up to date per folder (MS.flat_dirs): a folder is only re-done when its `entries`
+-- table is a different one (store_listing stores a new table whenever the listing changed), and its new items are merged into the
+-- sorted list instead of normalising and sorting all ~30,000 entries again after every listing.
 local function build_flat()
-    local flat, n = {}, 0
+    local recs = MS.flat_dirs or {}
+    local old = MS.flat_dirs and MS.flat
+    local pass = (MS.flat_pass or 0) + 1
+    local changed, any = {}, false
     for dirhref, c in pairs(dir_cache) do
         if type(c.entries) == "table" then
-            for _, e in ipairs(c.entries) do
-                local hay = U.norm_text(e.name)
-                n = n + 1
-                flat[n] = { hay = hay, key = pad_digits(hay), e = e, dir = dirhref }
+            local r = recs[dirhref]
+            if not r or r.entries ~= c.entries then
+                r = MS.flat_dir(dirhref, c.entries, r)
+                recs[dirhref] = r
+                changed[dirhref], any = true, true
             end
+            r.pass = pass
         end
     end
-    table.sort(flat, function(a, b) return a.key < b.key end)
-    MS.flat, MS.flat_version, MS.flat_built_at = flat, MS.cache_version, U.now_s()
+    for dirhref, r in pairs(recs) do                          -- folders that left the cache
+        if r.pass ~= pass then recs[dirhref] = nil; changed[dirhref], any = true, true end
+    end
+    MS.flat_dirs, MS.flat_pass = recs, pass
+    if not old then
+        local flat, n = {}, 0
+        for _, r in pairs(recs) do for _, it in ipairs(r.items) do n = n + 1; flat[n] = it end end
+        table.sort(flat, MS.flat_less)
+        MS.flat = flat
+    elseif any then
+        -- the unchanged folders' items are still in order: keep them, sort only the changed folders' items, merge
+        local keep, kn, add, an = {}, 0, {}, 0
+        for _, it in ipairs(old) do if not changed[it.dir] then kn = kn + 1; keep[kn] = it end end
+        for dirhref in pairs(changed) do
+            local r = recs[dirhref]
+            if r then for _, it in ipairs(r.items) do an = an + 1; add[an] = it end end
+        end
+        table.sort(add, MS.flat_less)
+        local flat, n, i, j = {}, 0, 1, 1
+        while i <= kn or j <= an do
+            local a, b = keep[i], add[j]
+            n = n + 1
+            if b and (not a or b.key < a.key or (b.key == a.key and MS.flat_less(b, a))) then flat[n] = b; j = j + 1
+            else flat[n] = a; i = i + 1 end
+        end
+        MS.flat = flat
+    end
+    MS.flat_version, MS.flat_built_at = MS.cache_version, U.now_s()
 end
 
 local function run_global_search()
@@ -2485,6 +3079,7 @@ search_append = function(ch)
     local c = MS.scur_get()
     search_query = search_query:sub(1, c) .. ch .. search_query:sub(c + 1)
     MS.scur = c + #ch
+    MS.XT.typed(true)
     MS.search_changed()
 end
 
@@ -2493,6 +3088,7 @@ search_backspace = function()
     if c == 0 then return end
     local p = MS.scur_prev(search_query, c)
     search_query, MS.scur = search_query:sub(1, p) .. search_query:sub(c + 1), p
+    MS.XT.typed(false)
     MS.search_changed()
 end
 
@@ -2500,6 +3096,7 @@ function MS.search_delete()
     local c = MS.scur_get()
     if c >= #search_query then return end
     search_query = search_query:sub(1, c) .. search_query:sub(MS.scur_next(search_query, c) + 1)
+    MS.XT.typed(false)
     MS.search_changed()
 end
 
@@ -2518,6 +3115,7 @@ function MS.scur_move(dir)
         while c < #q and q:sub(c + 1, c + 1) ~= " " do c = c + 1 end
     end
     MS.scur = c
+    if MS.XT then MS.XT.typed(false) end
     render()
 end
 
@@ -2540,20 +3138,26 @@ function D.rect_path(x1, y1, x2, y2)
     return string.format("m %d %d l %d %d l %d %d l %d %d", x1, y1, x2, y1, x2, y2, x1, y2)
 end
 
-function D.rounded_path(x1, y1, x2, y2, r)
+-- fractions of a pixel for the soft shapes that move (the glow on a card's bar)
+function D.fp(v) return (string.format("%.2f", v):gsub("%.?0+$", "")) end
+function D.rounded_path(x1, y1, x2, y2, r, fine)
     r = math.max(0, math.min(r, (x2 - x1) / 2, (y2 - y1) / 2))
-    if r < 1 then return D.rect_path(x1, y1, x2, y2) end
+    local n = fine and D.fp or D.rd
+    if r < 1 then
+        if not fine then return D.rect_path(x1, y1, x2, y2) end
+        return string.format("m %s %s l %s %s l %s %s l %s %s", n(x1), n(y1), n(x2), n(y1), n(x2), n(y2), n(x1), n(y2))
+    end
     local k = r * 0.5522847
     return table.concat({
-        string.format("m %d %d",   D.rd(x1 + r), D.rd(y1)),
-        string.format("l %d %d",   D.rd(x2 - r), D.rd(y1)),
-        string.format("b %d %d %d %d %d %d", D.rd(x2 - r + k), D.rd(y1), D.rd(x2), D.rd(y1 + r - k), D.rd(x2), D.rd(y1 + r)),
-        string.format("l %d %d",   D.rd(x2), D.rd(y2 - r)),
-        string.format("b %d %d %d %d %d %d", D.rd(x2), D.rd(y2 - r + k), D.rd(x2 - r + k), D.rd(y2), D.rd(x2 - r), D.rd(y2)),
-        string.format("l %d %d",   D.rd(x1 + r), D.rd(y2)),
-        string.format("b %d %d %d %d %d %d", D.rd(x1 + r - k), D.rd(y2), D.rd(x1), D.rd(y2 - r + k), D.rd(x1), D.rd(y2 - r)),
-        string.format("l %d %d",   D.rd(x1), D.rd(y1 + r)),
-        string.format("b %d %d %d %d %d %d", D.rd(x1), D.rd(y1 + r - k), D.rd(x1 + r - k), D.rd(y1), D.rd(x1 + r), D.rd(y1)),
+        string.format("m %s %s",   n(x1 + r), n(y1)),
+        string.format("l %s %s",   n(x2 - r), n(y1)),
+        string.format("b %s %s %s %s %s %s", n(x2 - r + k), n(y1), n(x2), n(y1 + r - k), n(x2), n(y1 + r)),
+        string.format("l %s %s",   n(x2), n(y2 - r)),
+        string.format("b %s %s %s %s %s %s", n(x2), n(y2 - r + k), n(x2 - r + k), n(y2), n(x2 - r), n(y2)),
+        string.format("l %s %s",   n(x1 + r), n(y2)),
+        string.format("b %s %s %s %s %s %s", n(x1 + r - k), n(y2), n(x1), n(y2 - r + k), n(x1), n(y2 - r)),
+        string.format("l %s %s",   n(x1), n(y1 + r)),
+        string.format("b %s %s %s %s %s %s", n(x1), n(y1 + r - k), n(x1 + r - k), n(y1), n(x1 + r), n(y1)),
     }, " ")
 end
 
@@ -2568,10 +3172,40 @@ function D.ev_shape(path, fill_rgb, fill_a, border_rgb, border_a, border_w)
     return string.format("{\\an7\\pos(0,0)%s\\p1}%s{\\p0}", tags, path)
 end
 
-function D.ev_rect(x1, y1, x2, y2, fill_rgb, fill_a, border_rgb, border_a, border_w, radius)
+function D.ev_rect(x1, y1, x2, y2, fill_rgb, fill_a, border_rgb, border_a, border_w, radius, fine)
     if x2 <= x1 or y2 <= y1 then return "" end
-    local path = (radius and radius > 0) and D.rounded_path(x1, y1, x2, y2, radius) or D.rect_path(x1, y1, x2, y2)
+    local path = (fine or (radius and radius > 0)) and D.rounded_path(x1, y1, x2, y2, radius or 0, fine) or D.rect_path(x1, y1, x2, y2)
     return D.ev_shape(path, fill_rgb, fill_a, border_rgb, border_a, border_w)
+end
+
+-- an "x" as a shape, centred exactly on cx, cy (a font's "×" sits a little off-centre): arm length a, stroke t
+function D.cross_path(cx, cy, a, t)
+    local pts = { { t, a }, { t, t }, { a, t }, { a, -t }, { t, -t }, { t, -a }, { -t, -a }, { -t, -t }, { -a, -t }, { -a, t }, { -t, t }, { -t, a } }
+    local c = math.sqrt(0.5)
+    local out = {}
+    for i, q in ipairs(pts) do
+        out[#out + 1] = (i == 1 and "m " or (i == 2 and "l " or "")) .. string.format("%d %d", D.rd(cx + (q[1] - q[2]) * c), D.rd(cy + (q[1] + q[2]) * c))
+    end
+    return table.concat(out, " ")
+end
+-- text width measured by libass (cached)
+D.mwc = {}
+function D.mw(str, fs, bold, fsp, ww, wh)
+    str = tostring(str or "")
+    local key = table.concat({ str, fs, tostring(bold), fsp or 0, ww, wh }, "|")
+    if D.mwc[key] then return D.mwc[key] end
+    D.mo = D.mo or mp.create_osd_overlay("ass-events")
+    local mo = D.mo
+    mo.res_x, mo.res_y, mo.hidden, mo.compute_bounds = math.floor(ww), math.floor(wh), true, true
+    mo.data = D.ev_text(0, wh / 2, 7, string.format("\\fs%d\\b%d%s", fs, bold and 1 or 0, fsp and ("\\fsp" .. fsp) or ""), U.ass_escape(str))
+    local ok, r = pcall(mo.update, mo)
+    local w = (ok and type(r) == "table" and r.x1) and (r.x1 - r.x0) or (U.utf8_len(str) * fs * (bold and 0.58 or 0.52) + (fsp or 0) * U.utf8_len(str))
+    D.mwc[key] = w
+    return w
+end
+-- the toast look for small controls in the header: a faint glass fill and a hairline edge
+function D.ev_pill(x1, y1, x2, y2, r, S, fill_rgb, fill_a, edge_a)
+    return D.ev_rect(x1, y1, x2, y2, fill_rgb or "FFFFFF", fill_a or 6, "FFFFFF", edge_a or 17, math.max(1, math.floor((S or 1) + 0.5)), r)
 end
 
 function D.clip_tag(x1, y1, x2, y2)
@@ -2624,6 +3258,60 @@ local function build_breadcrumb(path, max_px)
     return U.fit_text(s, max_px, o.font_size - 6)
 end
 
+-- 26.10 experimental_caret in the list view: the cursor blinks (solid while you type) and the letter just typed fades
+-- in. Its own small timers (the list has no animation layer); nothing runs while the box is not being typed in.
+MS.XT = { FADE = 0.15 }
+function MS.XT.on() return o.experimental_caret == true end
+function MS.XT.still()                 -- a fade only when nothing plays behind the browser
+    return o.animations ~= false and not (mp.get_property("path") and mp.get_property_bool("pause", true) == false)
+end
+function MS.XT.typed(ins)
+    MS.XT.t, MS.XT.ins = mp.get_time(), ins and true or nil
+    if not MS.XT.on() then return end
+    MS.XT.arm()
+    if ins and MS.XT.still() then
+        if MS.XT.ft then MS.XT.ft:kill() end
+        MS.XT.ft = mp.add_periodic_timer(1 / 60, function()
+            if not browser_active or mp.get_time() - MS.XT.t > MS.XT.FADE + 0.02 then MS.XT.ft:kill(); MS.XT.ft = nil end
+            render()
+        end)
+    end
+end
+function MS.XT.vis()
+    if not MS.XT.on() or not MS.XT.still() then return true end      -- (animations=no, or over a playing video: solid)
+    local dt = mp.get_time() - (MS.XT.t or 0)
+    if dt < 0.55 then return true end
+    return math.floor((dt - 0.55) / 0.53) % 2 == 1
+end
+function MS.XT.arm()
+    if MS.XT.bt or not MS.XT.on() then return end
+    MS.XT.bt = mp.add_periodic_timer(0.1, function()
+        if not (browser_active and search_active) then MS.XT.bt:kill(); MS.XT.bt, MS.XT.cv = nil, nil; return end
+        local v = MS.XT.vis()
+        if v ~= MS.XT.cv then MS.XT.cv = v; render() end
+    end)
+end
+-- "before▏after", escaped, with the caret (see-through while it blinks off) and the fading last letter
+function MS.XT.field(before, after)
+    if not MS.XT.on() then return U.ass_escape(before) .. "▏" .. U.ass_escape(after) end
+    MS.XT.arm()
+    local vis = MS.XT.vis()
+    MS.XT.cv = vis
+    local head, last = before, ""
+    local dt = mp.get_time() - (MS.XT.t or 0)
+    if MS.XT.ins and dt < MS.XT.FADE and before ~= "" and MS.XT.still() then
+        local i = #before
+        while i > 1 and before:byte(i) >= 128 and before:byte(i) < 192 do i = i - 1 end
+        head, last = before:sub(1, i - 1), before:sub(i)
+    end
+    local out = U.ass_escape(head)
+    if last ~= "" then
+        local k = 1 - (1 - dt / MS.XT.FADE) ^ 3
+        out = out .. "{\\1a" .. U.ass_alpha(100 * k) .. "}" .. U.ass_escape(last) .. "{\\1a&H00&}"
+    end
+    return out .. (vis and "▏" or "{\\1a&HFF&}▏{\\1a&H00&}") .. U.ass_escape(after)
+end
+
 -- Renders the search UI for one panel's second header line.
 -- big=true  -> actively typing: large font + accent pill, unmistakable.
 -- big=false -> confirmed filter: small warn-colored chip, unobtrusive.
@@ -2641,7 +3329,7 @@ local function draw_search_indicator(chunks, rect, y, match_count, big)
         table.insert(chunks, D.ev_rect(rect.x1 + pad, y - fs_big * 0.72, rect.x2 - pad, y + fs_big * 0.5,
             THEME.accent, 16, THEME.accent, 55, 1, o.corner_radius_small))
         local c = MS.scur_get and MS.scur_get() or #search_query
-        local text = string.format("{\\b0}%s{\\b1} %s▏%s", ICONS.search, U.ass_escape(search_query:sub(1, c)), U.ass_escape(search_query:sub(c + 1)))
+        local text = string.format("{\\b0}%s{\\b1} %s", ICONS.search, MS.XT.field(search_query:sub(1, c), search_query:sub(c + 1)))
         table.insert(chunks, D.ev_text(rect.x1 + pad + 10, y, 4,
             string.format("%s\\b1\\fs%d\\c%s", clip, fs_big, U.ass_color(THEME.accent)), text))
         table.insert(chunks, D.ev_text(rect.x2 - pad - 10, y, 6,
@@ -2719,10 +3407,11 @@ local function compute_layout()
     }
 end
 
-local function keep_selection_in_view()
+-- panel_items: { sidebar = list, episodes = list } as render built them for this frame
+local function keep_selection_in_view(panel_items)
     if not layout then return end
     for _, panel in ipairs({ "sidebar", "episodes" }) do
-        local items = get_panel_items(panel)
+        local items = panel_items and panel_items[panel] or get_panel_items(panel)
         local rect = (panel == "sidebar") and layout.sidebar or layout.list
         local vis = visible_rows_for(rect, layout.panel_header_h, layout.row_h)
         local sel = (panel == "sidebar") and sidebar_selected_index or selected_episode
@@ -2779,7 +3468,7 @@ local function draw_scrollbar(chunks, rect, header_h, scroll, n_items, n_vis, pa
 end
 
 -- ============================================================
--- CLEAN TITLES (experimental_clean_titles)
+-- CLEAN TITLES (clean_titles)
 -- ============================================================
 -- "The.Gentlemen.S02E03.2160p.NF.WEB-DL.DV.HDR.Atmos.H.265-GRP.mkv"  ->  "S02E03" + [4K] [HDR] [DV] [ATMOS]
 -- Everything is wrapped in pcall; if a name can't be parsed the raw name is shown unchanged.
@@ -2968,6 +3657,7 @@ function CT.parse(name)
     CT.cache[name] = res
     return res
 end
+MS.ct_parse = CT.parse          -- for the download card (MS is older than CT)
 
 -- true when every parsed media file in the list shares one show title (then the title is redundant
 -- on each row and only "S01E03" is shown)
@@ -3110,21 +3800,40 @@ function CT.strip_tail(t)
         local l = t:lower()
         local function cut(pat)
             local a = l:find(pat)
-            if a then t = t:sub(1, a - 1); l = t:lower() end
+            if not a then return end
+            -- never down to nothing or a bare article: "The Collection" (2012) is a film's whole name
+            local rest = t:sub(1, a - 1):lower():gsub("^[%s%p]+", ""):gsub("[%s%p]+$", "")
+            if rest == "" or rest == "the" or rest == "a" or rest == "an" then return end
+            t = t:sub(1, a - 1); l = t:lower()
         end
         cut("%s+seasons?%s*%d+.*$")
         cut("%s+box%s*%d+.*$")
         cut("%s+usbd$"); cut("%s+hd$"); cut("%s+tl$"); cut("%s+bd$"); cut("%s+remux$"); cut("%s+complete$"); cut("%s+collection$")
+        -- "Pokemon Horizons Eng Dub", "Show English Subbed", "Show Dual Audio": the language of the release, not the title
+        cut("%s+eng?l?i?s?h?%s+dub%a*$"); cut("%s+eng?l?i?s?h?%s+sub%a*$"); cut("%s+dual[%s%-]*audio$"); cut("%s+multi[%s%-]*subs?$")
+        cut("%s+dubbed$"); cut("%s+subbed$")
         if t == old then break end
     end
     return t
 end
 
 CT.fcache, CT.fcount = {}, 0
+-- "Pokemon Horizons Episode 1 to 6 [720p]" / "Show Ep 7-16": the episode range is not part of the title.
+CT.EP_RANGE = { "^(.-)[%s%._%-]+[Ee]pisodes?[%s%._]*%d+[%s%._]*[Tt][Oo][%s%._]*%d+",
+                "^(.-)[%s%._%-]+[Ee]pisodes?[%s%._]*%d+[%s%._]*[%-~]+[%s%._]*%d+",
+                "^(.-)[%s%._%-]+[Ee][Pp][%s%._]*%d+[%s%._]*[%-~]+[%s%._]*%d+" }
+function CT.strip_ep_range(name)
+    for _, pat in ipairs(CT.EP_RANGE) do
+        local s, e, b = name:find(pat)
+        if s and #b >= 2 then return b .. name:sub(e + 1) end
+    end
+    return name
+end
+
 function CT.parse_folder(name)
     local hit = CT.fcache[name]
     if hit ~= nil then return hit end
-    local ok, res = pcall(CT.parse_folder_raw, name)
+    local ok, res = pcall(CT.parse_folder_raw, CT.strip_ep_range(name))
     if not ok then res = false end
     CT.fcount = CT.fcount + 1
     if CT.fcount > 3000 then CT.fcache, CT.fcount = {}, 1 end
@@ -3149,11 +3858,11 @@ end
 -- ============================================================
 -- ROW DRAWING (continued)
 -- ============================================================
-local function draw_sidebar_rows(chunks, hitboxes, rect)
+local function draw_sidebar_rows(chunks, hitboxes, rect, items)
     local header_h = layout.panel_header_h
     local row_h = layout.row_h
     local fs = layout.fs
-    local items = get_panel_items("sidebar")
+    items = items or get_panel_items("sidebar")
     local selected_idx = sidebar_selected_index
     local scroll_off = scroll_offset_folders
     local vis = visible_rows_for(rect, header_h, row_h)
@@ -3233,7 +3942,7 @@ local function draw_sidebar_rows(chunks, hitboxes, rect)
         end
 
         -- cleaned folder name: Title  S01  1080p REMUX  GROUP   (extras are dropped, last first, if the row is narrow)
-        local fp = (o.experimental_clean_titles and o.clean_folder_titles and not node.virtual) and CT.parse_folder(node.name) or nil
+        local fp = (o.clean_titles and o.clean_folder_titles and not node.virtual) and CT.parse_folder(node.name) or nil
         if fp then
             local budget = max_name_px - 30 - (node.href == current_path and 16 or 0)
             local title_min = math.min(U.utf8_len(fp.title) * fs * 0.62, fs * 0.62 * 14)
@@ -3280,11 +3989,11 @@ local function draw_sidebar_rows(chunks, hitboxes, rect)
     end
 end
 
-local function draw_episode_rows(chunks, hitboxes, rect)
+local function draw_episode_rows(chunks, hitboxes, rect, items)
     local header_h = layout.panel_header_h
     local row_h = layout.row_h
     local fs = layout.fs
-    local items = get_panel_items("episodes")
+    items = items or get_panel_items("episodes")
     local selected_idx = selected_episode
     local scroll_off = scroll_offset_episodes
     local vis = visible_rows_for(rect, header_h, row_h)
@@ -3295,7 +4004,7 @@ local function draw_episode_rows(chunks, hitboxes, rect)
     local body_x2, body_y2 = rect.x2 - 1, rect.y2 - 1
     local clip = D.clip_tag(body_x1, body_y1, body_x2, body_y2)
 
-    local clean = o.experimental_clean_titles and not is_global
+    local clean = o.clean_titles and not is_global
     local uniform = clean and CT.uniform_title(items)
     local cfs = math.max(10, fs - 8)
 
@@ -3596,9 +4305,14 @@ render = function()
         MS.last_overlay_data = nil
         return
     end
+    if MS.XE and MS.XE.t0 then return end            -- fading out (experimental_exit_to_video): the frozen page fades
 
     layout = compute_layout()
-    keep_selection_in_view()
+    -- Both panel lists are built ONCE per frame and handed to everything below (they were rebuilt about six
+    -- times, and with a folder filter each build searched and sorted the whole tree). Nothing in a render
+    -- changes them, and a new frame builds them fresh, so they are never stale.
+    local sb_items, ep_items = get_panel_items("sidebar"), get_panel_items("episodes")
+    keep_selection_in_view({ sidebar = sb_items, episodes = ep_items })
 
     local w, h = layout.w, layout.h
     local sidebar, list = layout.sidebar, layout.list
@@ -3612,28 +4326,34 @@ render = function()
     -- ---- header ----
     table.insert(chunks, D.ev_rect(0, 0, w, layout.header_h, THEME.bg_header, o.header_opacity, nil, 0, 0))
     table.insert(chunks, D.ev_rect(0, layout.header_h - 2, w, layout.header_h,
-        U.pick(o.color_border_grad_top, "909090"), 35, nil, 0, 0))
+        THEME.grad_top, 35, nil, 0, 0))
     table.insert(chunks, D.ev_text(14, layout.header_h / 2 - 8, 4,
         string.format("\\b1\\fs%d\\c%s", fs + 4, U.ass_color(THEME.text_primary)), "WebDAV Browser"))
     table.insert(chunks, D.ev_text(14, layout.header_h / 2 + 12, 4,
         string.format("\\fs%d\\c%s", fs - 6, U.ass_color(THEME.text_muted)), U.ass_escape(host_label)))
 
-    local dot = any_fail and THEME.bad or THEME.good
-    table.insert(chunks, D.ev_text(w - 110, layout.header_h / 2, 6,
-        string.format("\\fs%d\\c%s", fs - 2, U.ass_color(dot)), "●"))
-    table.insert(chunks, D.ev_text(w - 96, layout.header_h / 2, 4,
-        string.format("\\fs%d\\c%s", fs - 6, U.ass_color(THEME.text_muted)),
-        any_fail and "error" or "connected"))
+    -- the connection, right-aligned and kept apart from the close button; offline says how to retry
+    -- the connection pill and the close button, in the toast look (faint glass, hairline edge), one height
+    -- "Connected" only once the server has answered: while the first listing is on its way it says so
+    local st_txt = any_fail and ("Offline  ·  " .. U.kname("refresh") .. " to retry") or (is_loading and "Loading…") or "Connected"
+    local sfs = fs - 6
+    local ph = math.floor(sfs * 1.9 + 0.5)
+    local bcx, bcy = w - 16 - ph / 2, math.floor(layout.header_h / 2)
+    table.insert(chunks, D.ev_pill(bcx - ph / 2, bcy - ph / 2, bcx + ph / 2, bcy + ph / 2, ph / 2, 1))
+    table.insert(chunks, D.ev_shape(D.cross_path(bcx, bcy, ph * 0.2, math.max(1, ph * 0.045)), THEME.text_muted, 100))
+    table.insert(buttons, { x1 = bcx - ph / 2 - 6, y1 = bcy - ph / 2 - 4, x2 = bcx + ph / 2 + 6, y2 = bcy + ph / 2 + 4, action = "close" })
+    local dr = math.max(3, math.floor(sfs * 0.2 + 0.5))
+    local sx2 = bcx - ph / 2 - 10
+    local sx1 = sx2 - D.mw(st_txt, sfs, false, nil, w, h) - ph * 0.95 - dr * 2 - sfs * 0.5
+    table.insert(chunks, D.ev_pill(sx1, bcy - ph / 2, sx2, bcy + ph / 2, ph / 2, 1, any_fail and THEME.bad or "FFFFFF", any_fail and 14 or 6))
+    table.insert(chunks, D.ev_rect(sx1 + ph * 0.5 - dr, bcy - dr, sx1 + ph * 0.5 + dr, bcy + dr, any_fail and THEME.bad or (is_loading and THEME.warn or THEME.good), 100, nil, 0, 0, dr))
+    table.insert(chunks, D.ev_text(sx1 + ph * 0.5 + dr + sfs * 0.5, bcy, 4,
+        string.format("\\fs%d\\c%s", sfs, U.ass_color(any_fail and THEME.bad or THEME.text_primary)), U.ass_escape(st_txt)))
     if IDX.running then
-        table.insert(chunks, D.ev_text(w - 128, layout.header_h / 2, 6,
-            string.format("\\fs%d\\c%s", fs - 6, U.ass_color(THEME.accent)),
+        table.insert(chunks, D.ev_text(sx1 - 12, bcy, 6,
+            string.format("\\fs%d\\c%s", sfs, U.ass_color(THEME.accent)),
             string.format("%s indexing %d", spinner_frames[spinner_idx], IDX.scanned)))
     end
-
-    local cx1, cy1, cx2, cy2 = w - 40, 8, w - 12, layout.header_h - 8
-    table.insert(chunks, D.ev_text((cx1 + cx2) / 2, (cy1 + cy2) / 2, 5,
-        string.format("\\b1\\fs%d\\c%s", fs + 2, U.ass_color(THEME.text_muted)), "×"))
-    table.insert(buttons, { x1 = cx1 - 6, y1 = cy1 - 4, x2 = cx2 + 6, y2 = cy2 + 4, action = "close" })
 
     local function paint_panel(rect, focused)
         local bg = focused and THEME.bg_panel or THEME.bg_panel_dim
@@ -3644,9 +4364,9 @@ render = function()
 
         if o.border_gradient_enabled then
             D.draw_gradient_border(chunks, rect.x1, rect.y1, rect.x2, rect.y2, o.corner_radius, bw,
-                { U.pick(o.color_border_grad_top, "909090"),
-                  U.pick(o.color_border_grad_mid, "404040"),
-                  U.pick(o.color_border_grad_bottom, "909090") },
+                { THEME.grad_top,
+                  THEME.grad_mid,
+                  THEME.grad_bottom },
                 border_alpha)
         else
             table.insert(chunks, D.ev_rect(rect.x1, rect.y1, rect.x2, rect.y2, THEME.border_unfocus, 0, THEME.border_unfocus, border_alpha, bw, o.corner_radius))
@@ -3666,9 +4386,9 @@ render = function()
         (sb_focus and "▸  " or "") .. "Folders"))
 
     if search_scope == "sidebar" and search_active then
-        draw_search_indicator(chunks, sidebar, sidebar.y1 + layout.sub_line_y, #get_panel_items("sidebar"), true)
+        draw_search_indicator(chunks, sidebar, sidebar.y1 + layout.sub_line_y, #sb_items, true)
     elseif search_scope == "sidebar" and search_query ~= "" then
-        draw_search_indicator(chunks, sidebar, sidebar.y1 + layout.sub_line_y, #get_panel_items("sidebar"), false)
+        draw_search_indicator(chunks, sidebar, sidebar.y1 + layout.sub_line_y, #sb_items, false)
     else
         local crumb = (current_path == CW_HREF) and "Continue Watching"
             or build_breadcrumb(current_path, sidebar.x2 - sidebar.x1 - 24)
@@ -3689,7 +4409,7 @@ render = function()
     else
         title = U.basename(current_path)
         if title == "" then title = "Root" end
-        if o.experimental_clean_titles and o.clean_folder_titles then
+        if o.clean_titles and o.clean_folder_titles then
             local fp = CT.parse_folder(title)
             if fp then
                 title = fp.title .. (fp.season and ("  " .. fp.season) or "") .. (fp.group and ("  " .. fp.group) or "")
@@ -3700,7 +4420,6 @@ render = function()
         string.format("\\b1\\fs%d\\c%s", fs, U.ass_color(ep_focus and THEME.accent or THEME.text_primary)),
         (ep_focus and "▸  " or "") .. U.ass_escape(U.fit_text(title, (list.x2 - list.x1) * 0.55, fs))))
 
-    local ep_items = get_panel_items("episodes")
     local vis_ep = visible_rows_for(list, layout.panel_header_h, layout.row_h)
 
     if search_scope == "global" and search_active then
@@ -3743,7 +4462,7 @@ render = function()
             string.format("\\fs%d\\c%s", fs + 2, U.ass_color(THEME.text_muted)),
             spinner_frames[spinner_idx] .. "  Loading..."))
     else
-        draw_sidebar_rows(chunks, hitboxes, sidebar)
+        draw_sidebar_rows(chunks, hitboxes, sidebar, sb_items)
     end
 
     local files_loading = is_loading and #file_entries == 0 and current_path ~= CW_HREF and search_scope ~= "global"
@@ -3758,25 +4477,26 @@ render = function()
         table.insert(chunks, D.ev_text(cx_, cy_ + 18, 5,
             string.format("\\fs%d\\c%s", fs - 6, U.ass_color(THEME.text_muted)), "Press R to retry"))
     else
-        draw_episode_rows(chunks, hitboxes, list)
+        draw_episode_rows(chunks, hitboxes, list, ep_items)
     end
 
     -- ---- footer ----
     table.insert(chunks, D.ev_rect(0, h - layout.footer_h, w, h, THEME.bg_header, o.footer_opacity, nil, 0, 0))
     table.insert(chunks, D.ev_rect(0, h - layout.footer_h, w, h - layout.footer_h + 2,
-        U.pick(o.color_border_grad_top, "909090"), 35, nil, 0, 0))
+        THEME.grad_top, 35, nil, 0, 0))
     local hint
     if search_active then
         hint = "Type to search   ↑↓ Results   Enter Confirm   Esc Cancel"
     else
         local ck = (tostring(o.cache_clear_key or ""):match("[^%s,]+") or ""):upper()
-        hint = "↑↓ Move   Tab Panel   Enter Play/Open   ←/BS Up   / Filter   F Search all   A Queue   P Download+play   S Sort   R Refresh   M Watched   H Hide   "
-            .. (ck ~= "" and (ck .. " Clear cache   ") or "") .. "D Debug   Esc Close"
+        hint = U.hint({ "↑↓ Move", { "switch_panel", "Panel" }, { "open", "Play/Open" }, { "back", "Up" }, { "search_folder", "Filter" },
+            { "search", "Search all" }, { "queue", "Queue" }, { "play_download", "Download+play" }, { "sort", "Sort" }, { "refresh", "Refresh" },
+            { "watched", "Watched" }, { "hide_watched", "Hide" }, ck ~= "" and (ck .. " Clear cache") or "", { "debug", "Debug" }, { "close", "Close" } })
     end
     table.insert(chunks, D.ev_text(14, h - layout.footer_h + 16, 4,
         string.format("\\fs%d\\c%s", fs - 6, U.ass_color(THEME.text_muted)),
         U.ass_escape(U.fit_text(hint, w - 28, fs - 6))))
-    local st_col = status_line:match("^Failed") and THEME.bad or THEME.good
+    local st_col = (status_line:match("^Failed") or status_line:match("^Couldn't")) and THEME.bad or THEME.good
     table.insert(chunks, D.ev_text(14, h - layout.footer_h + 38, 4,
         string.format("\\fs%d\\c%s", fs - 4, U.ass_color(st_col)), U.ass_escape(U.fit_text(status_line, w * 0.55, fs - 4))))
     if search_scope == "global" or IDX.running then
@@ -3820,12 +4540,12 @@ render = function()
         end
         return false
     end
-    if o.experimental_clean_titles and o.clean_titles_tooltip and hover_index and not MS.drag and hover_is_live() then
+    if o.clean_titles and o.clean_titles_tooltip and hover_index and not MS.drag and hover_is_live() then
         if hover_panel == "episodes" and search_scope ~= "global" then
             local it = ep_items[hover_index]
             if it and not it.is_dir and U.is_media(it.name) and CT.parse(it.name) then tip_name = it.name end
         elseif hover_panel == "sidebar" and o.clean_folder_titles then
-            local nd = get_panel_items("sidebar")[hover_index]
+            local nd = sb_items[hover_index]
             if nd and not nd.virtual and CT.parse_folder(nd.name) then tip_name = nd.name end
         end
     end
@@ -3864,6 +4584,36 @@ function U.mouse_xy()
     return m.x, m.y
 end
 
+-- Keys of one browser action from the conf (key_<name>); right_click_back adds the right mouse button to "back".
+function U.kb(name)
+    local out = {}
+    for k in tostring(o["key_" .. name] or ""):gmatch("[^%s,]+") do out[#out + 1] = k end
+    if name == "back" and o.right_click_back then out[#out + 1] = "MBTN_RIGHT" end
+    return out
+end
+-- How a key is written in the footer hints: the first key of the action ("ENTER" -> "Enter", "ctrl+d" -> "Ctrl+D")
+function U.kname(name)
+    local k = U.kb(name)[1]
+    if not k then return "" end
+    local nice = { ENTER = "Enter", ESC = "Esc", BS = "Backspace", MBTN_BACK = "Mouse-back", MBTN_RIGHT = "Right-click",
+                   PGUP = "PgUp", PGDWN = "PgDn", HOME = "Home", END = "End", TAB = "Tab", SPACE = "Space" }
+    if nice[k] then return nice[k] end
+    if #k == 1 then return k:upper() end
+    return (k:gsub("(%a)(%w*)", function(a, b) return a:upper() .. b:lower() end))
+end
+
+-- footer hint from { {action, label}, "literal", ... }: actions with no key set are left out
+function U.hint(parts)
+    local out = {}
+    for _, p in ipairs(parts) do
+        if type(p) == "string" then if p ~= "" then out[#out + 1] = p end
+        else
+            local k = U.kname(p[1])
+            if k ~= "" then out[#out + 1] = k .. " " .. p[2] end
+        end
+    end
+    return table.concat(out, "   ")
+end
 function U.point_in(x, y, r)
     return x >= r.x1 and x <= r.x2 and y >= r.y1 and y <= r.y2
 end
@@ -3926,6 +4676,11 @@ local function click_row(hb, is_double)
     selected_episode = hb.index
     free_scroll.episodes = false
     if focus_panel ~= "episodes" then set_focus("episodes") end
+    -- single_click_open: one click on a file plays it (the second click of a double-click does nothing more)
+    if o.single_click_open then
+        if not is_double then open_selected(false) end
+        return
+    end
     if is_double then open_selected(false) else render() end
 end
 
@@ -3936,7 +4691,7 @@ local function mouse_down()
 
     for _, b in ipairs(button_hitboxes) do
         if (b.action == "close" or b.action == "sort") and U.point_in(mx, my, b) then
-            if b.action == "close" then close_browser() else toggle_sort(current_path) end
+            if b.action == "close" then MS.XE.dismiss() else toggle_sort(current_path) end
             return
         end
     end
@@ -4098,7 +4853,7 @@ local function clear_search_state()
 end
 
 local function esc_pressed()
-    if search_query ~= "" or search_scope ~= nil then clear_search_state() else close_browser() end
+    if search_query ~= "" or search_scope ~= nil then clear_search_state() else MS.XE.dismiss() end
 end
 
 REP, ONCE = { repeatable = true }, { repeatable = false }
@@ -4139,30 +4894,29 @@ local function build_browse_bindings()
     local function add(key, fn, flags) L[#L + 1] = { key, fn, flags or ONCE } end
     local function many(keys, fn, flags) for _, k in ipairs(keys) do add(k, fn, flags) end end
 
-    many(KEYS.up,    function() move_selection(-1) end, REP);  add("k", function() move_selection(-1) end, REP)
-    many(KEYS.down,  function() move_selection(1) end, REP);   add("j", function() move_selection(1) end, REP)
-    many(KEYS.pgup,  function() move_selection(-10) end, REP)
-    many(KEYS.pgdn,  function() move_selection(10) end, REP)
-    many(KEYS.home,  function() select_edge(true) end)
-    many(KEYS.end_,  function() select_edge(false) end)
-    many(KEYS.enter, function() open_selected(false) end)
-    many(KEYS.right, function() open_selected(true) end);      add("l", function() open_selected(true) end)
-    many(KEYS.left,  function() collapse_or_parent() end);     add("h", function() collapse_or_parent() end)
-    many(KEYS.bs,    function() collapse_or_parent() end)
-    add("MBTN_BACK", function() collapse_or_parent() end)
-    many(KEYS.tab,   function() switch_panel() end)
-    add("a", function() queue_add_current() end)
-    add("s", function() toggle_sort() end)
-    add("r", function() refresh_current() end)
-    add("R", function() refresh_all() end)
-    add("/", function() start_search() end)
-    add("f", function() start_search("global") end)
-    add("m", function() toggle_watched(selected_file()) end)
-    add("p", function() MS.fb_manual(selected_file()) end)
-    add("H", function() toggle_hide_watched() end)
-    add("d", function() MS.debug = not MS.debug; render() end)
+    many(U.kb("up"),        function() move_selection(-1) end, REP)
+    many(U.kb("down"),      function() move_selection(1) end, REP)
+    many(U.kb("page_up"),   function() move_selection(-10) end, REP)
+    many(U.kb("page_down"), function() move_selection(10) end, REP)
+    many(U.kb("first"),     function() select_edge(true) end)
+    many(U.kb("last"),      function() select_edge(false) end)
+    many(U.kb("open"),      function() open_selected(false) end)
+    many(U.kb("right"),     function() open_selected(true) end)
+    many(U.kb("left"),      function() collapse_or_parent() end)
+    many(U.kb("back"),      function() collapse_or_parent() end)
+    many(U.kb("switch_panel"), function() switch_panel() end)
+    many(U.kb("queue"),     function() queue_add_current() end)
+    many(U.kb("sort"),      function() toggle_sort() end)
+    many(U.kb("refresh"),   function() refresh_current() end)
+    many(U.kb("refresh_all"), function() refresh_all() end)
+    many(U.kb("search_folder"), function() start_search() end)
+    many(U.kb("search"),    function() start_search("global") end)
+    many(U.kb("watched"),   function() toggle_watched(selected_file()) end)
+    many(U.kb("play_download"), function() MS.fb_manual(selected_file()) end)
+    many(U.kb("hide_watched"), function() toggle_hide_watched() end)
+    many(U.kb("debug"),     function() MS.debug = not MS.debug; render() end)
     for k in tostring(o.cache_clear_key or ""):gmatch("[^%s,]+") do add(k, function() MS.clear_cache_key() end) end
-    add("ESC", esc_pressed)
+    many(U.kb("close"), esc_pressed)
     -- gamepads (mpv: input-gamepad=yes) and TV remotes
     many({ "GAMEPAD_DPAD_UP", "GAMEPAD_LEFT_STICK_UP" },       function() move_selection(-1) end, REP)
     many({ "GAMEPAD_DPAD_DOWN", "GAMEPAD_LEFT_STICK_DOWN" },   function() move_selection(1) end, REP)
@@ -4171,7 +4925,7 @@ local function build_browse_bindings()
     many({ "GAMEPAD_LEFT_SHOULDER", "CHANNEL_UP" },    function() move_selection(-10) end, REP)
     many({ "GAMEPAD_RIGHT_SHOULDER", "CHANNEL_DOWN" }, function() move_selection(10) end, REP)
     many({ "GAMEPAD_ACTION_DOWN", "PLAY", "PLAYPAUSE", "PLAYONLY" }, function() open_selected(false) end)
-    many({ "GAMEPAD_ACTION_RIGHT", "BACK", "CANCEL" }, esc_pressed)
+    many({ "GAMEPAD_ACTION_RIGHT", "GO_BACK", "BACK", "CANCEL" }, esc_pressed)
     add("GAMEPAD_ACTION_LEFT", function() toggle_watched(selected_file()) end)
     add("GAMEPAD_ACTION_UP", function() queue_add_current() end)
     many({ "GAMEPAD_START", "MENU" }, function() switch_panel() end)
@@ -4190,7 +4944,13 @@ safe_bind = function(name, key, fn, flags)
 end
 
 bind_all = function()
+    local seen = {}
     for _, kb in ipairs(build_browse_bindings()) do
+        if seen[kb[1]] and not MS.dup_warned then
+            MS.dup_warned = true
+            msg.warn("config: the key '" .. kb[1] .. "' is set for more than one action - the last one wins")
+        end
+        seen[kb[1]] = true
         local name = "webdav_" .. kb[1]
         safe_bind(name, kb[1], kb[2], kb[3])
         browse_bound[#browse_bound + 1] = name
@@ -4273,6 +5033,7 @@ end
 local function apply_config_changes(changed)
     normalize_options()
     THEME = build_theme()
+    TOAST = PAL.build_toast()
     ICONS = build_icons()
     auth_configured = false
     if changed.url or changed.user or changed.pass or changed.start_path then
@@ -4294,12 +5055,23 @@ local function apply_config_changes(changed)
     if browser_active then render() end
 end
 
+-- the conf file's size and date: the poll only reads the file again when they change
+function MS.conf_stamp()
+    if not MS.conf_path and mp.get_time() - (MS.conf_look or -99) > 30 then        -- a missing file: looked for again
+        MS.conf_look = mp.get_time()
+        local ok, pth = pcall(mp.find_config_file, "script-opts/webdav-browser.conf")
+        MS.conf_path = (ok and type(pth) == "string") and pth or false
+    end
+    local i = MS.conf_path and utils.file_info(MS.conf_path)
+    return i and (tostring(i.size) .. "|" .. tostring(i.mtime)) or "none"
+end
 local function reload_config()
+    MS.conf_sig = MS.conf_stamp()
     local fresh = {}
     for k, v in pairs(DEFAULTS) do fresh[k] = v end
     options.read_options(fresh, "webdav-browser")
     U.conf_notes = U.lenient_conf(fresh)
-    normalize_into(fresh)     -- same cleanup as at startup, otherwise "https://host/" would look changed forever
+    U.normalize_all(fresh)    -- the same cleanup as at the start, or a cleaned value looks changed for ever
     local changed, any = {}, false
     for k, v in pairs(fresh) do
         if o[k] ~= v then changed[k] = true; any = true end
@@ -4307,7 +5079,7 @@ local function reload_config()
     if not any then return end
     for k in pairs(changed) do o[k] = fresh[k] end
     apply_config_changes(changed)
-    mp.osd_message("webdav-browser: config reloaded", 2)
+    if browser_active and MS.toast then MS.toast({ eyebrow = "WEBDAV-BROWSER", title = "Config reloaded" }, 2) else mp.osd_message("webdav-browser: config reloaded", 2) end
     status_line = "Config reloaded"
     if browser_active then render() end
 end
@@ -4318,8 +5090,107 @@ mp.register_script_message("webdav-browser-reindex", function() index_start(true
 -- ============================================================
 -- OPEN / CLOSE
 -- ============================================================
+-- mpv's own controller draws its idle logo ("Drop files or URLs to play here") under the browser, and it shows
+-- through the see-through panels: hidden while the browser is open, put back as it was when it closes
+MS.logo = function(show)
+    if show then
+        if MS.logo_off then MS.logo_off = nil; mp.commandv("script-message", "osc-idlescreen", "yes", "no_osd") end
+    else
+        local on = mp.get_property_native("user-data/osc/idlescreen")
+        if on == nil then
+            -- the OSC only publishes this once it was changed: go by its settings (default: logo on)
+            on = mp.get_property_native("osc") == true
+            local so = mp.get_property_native("script-opts") or {}
+            if so["osc-idlescreen"] == "no" then on = false end
+            local ok, path = pcall(mp.command_native, { "expand-path", "~~/script-opts/osc.conf" })
+            local f = ok and path and io.open(path, "r")
+            if f then
+                local t = "\n" .. f:read("*a"); f:close()
+                if t:find("\n%s*idlescreen%s*=%s*no") then on = false end
+            end
+        end
+        if on == true then
+            MS.logo_off = true
+            mp.commandv("script-message", "osc-idlescreen", "no", "no_osd")
+        end
+    end
+end
+-- While the browser is open over a video, the player's own controller (osc / ModernZ) must not wake up when the
+-- mouse passes its seekbar zone: its thumbnails (thumbfast) used to show through the browser. It is hidden while
+-- the browser is open and set back to osc_visibility (auto) when it closes (hide_osc=no leaves it alone).
+MS.osc = function(hide)
+    if not o.hide_osc then return end
+    if hide then
+        if MS.osc_off then return end
+        MS.osc_off = true
+        mp.commandv("script-message", "osc-visibility", "never", "no_osd")
+        mp.commandv("script-message-to", "thumbfast", "clear")
+    elseif MS.osc_off then
+        MS.osc_off = nil
+        mp.commandv("script-message", "osc-visibility", tostring(o.osc_visibility or "auto"), "no_osd")
+    end
+end
+-- 26.10 experimental_exit_to_video: closing the list fades it into the video (0.2 s) instead of a cut. The page is
+-- frozen as it was and only its opacity changes; the open key (or Esc) again ends it at once.
+MS.XE = { DUR = 0.2, KEYS = { "ESC", "MBTN_LEFT", "MBTN_LEFT_DBL", "MBTN_RIGHT", "MBTN_RIGHT_DBL", "MBTN_MID", "MBTN_BACK",
+    "MBTN_FORWARD", "WHEEL_UP", "WHEEL_DOWN", "WHEEL_LEFT", "WHEEL_RIGHT", "ENTER", "SPACE", "BS" } }
+function MS.XE.fade(data, a)
+    local function sc(hx) return string.format("%02X", math.floor(255 - (255 - (tonumber(hx, 16) or 0)) * a + 0.5)) end
+    local base = string.format("\\alpha&H%02X&", math.floor(255 * (1 - a) + 0.5))
+    local out = {}
+    for line in (data .. "\n"):gmatch("([^\n]*)\n") do
+        if line ~= "" then
+            line = line:gsub("\\([1-4]a)&H(%x%x)&", function(t, hx) return "\\" .. t .. "&H" .. sc(hx) .. "&" end)
+            line = line:gsub("\\alpha&H(%x%x)&", function(hx) return "\\alpha&H" .. sc(hx) .. "&" end)
+            out[#out + 1] = (line:sub(1, 1) == "{") and ("{" .. base .. line:sub(2)) or ("{" .. base .. "}" .. line)
+        end
+    end
+    return table.concat(out, "\n")
+end
+function MS.XE.dismiss()
+    if MS.XE.t0 then return close_browser() end
+    local playing = mp.get_property("path") and mp.get_property_bool("pause", true) == false
+    if not (o.experimental_exit_to_video == true and o.animations ~= false and not playing and browser_active and MS.last_overlay_data) then
+        return close_browser()
+    end
+    MS.XE.t0, MS.XE.data = mp.get_time(), MS.last_overlay_data
+    unbind_all()                       -- the browser's keys go; the open key, Esc or a click end it at once
+    for _, k in ipairs(MS.XE.KEYS) do  -- and mpv's own mouse / wheel bindings stay out of it meanwhile
+        local end_now = (k == "ESC" or k:match("^MBTN_LEFT") ~= nil)
+        mp.add_forced_key_binding(k, "wb_xe_" .. k, function() if end_now then close_browser() end end)
+    end
+    MS.XE.timer = mp.add_periodic_timer(1 / 60, function()
+        local k = (mp.get_time() - (MS.XE.t0 or 0)) / MS.XE.DUR
+        if k >= 1 or not browser_active or not MS.XE.data then return close_browser() end
+        overlay.data = MS.XE.fade(MS.XE.data, 1 - k * k)
+        overlay:update()
+    end)
+end
+-- while the browser is open a press-and-move belongs to it (the scroll bar's thumb), not to mpv's window dragging
+-- (which takes the button away as soon as the pointer moves): an empty input section without allow-vo-dragging that
+-- covers the window tells mpv so
+function MS.nodrag(on)
+    local name = "webdav_nodrag_" .. mp.get_script_name()
+    if on == MS.nodrag_on then return end
+    MS.nodrag_on = on
+    if on then
+        mp.commandv("define-section", name, "", "default")
+        mp.commandv("enable-section", name, "allow-hide-cursor")
+        if mp.input_set_section_mouse_area then mp.input_set_section_mouse_area(name, 0, 0, 99999, 99999) end
+    else
+        mp.commandv("disable-section", name)
+    end
+end
 close_browser = function()
+    MS.nodrag(false)
+    if MS.XE.timer then MS.XE.timer:kill() end
+    if MS.XE.t0 then for _, k in ipairs(MS.XE.KEYS) do mp.remove_key_binding("wb_xe_" .. k) end end
+    MS.XE.t0, MS.XE.timer, MS.XE.data = nil, nil, nil
+    MS.osc(false)
+    MS.logo(true)
     browser_active = false
+    if MS.ts_follow then MS.ts_follow(false) end     -- a resting toast follows at once (its layer, its glass)
+    mp.commandv("script-message", "disable-elements", mp.get_script_name(), "")
     MS.drag = nil
     stop_anim()
     if MS.conf_timer then MS.conf_timer:kill(); MS.conf_timer = nil end
@@ -4343,23 +5214,33 @@ end
 -- opened last "owns" playback; the other one closes itself, and the data file is re-read so watch history
 -- written by the other script is not overwritten with stale data.
 MS.active = true
-local function reload_user_data()
+local function reload_user_data(if_changed)
     local path = persist_status.path or history_file_path()
     if not path then return end
-    local data = try_load_json(path)
+    if if_changed then
+        -- this instance owns the data: what it changed and has not written yet goes to disk first (it is the newest),
+        -- and the file is only read again when someone else wrote it since
+        if MS.active ~= false and (MS.prog_dirty or MS.hist_dirty) then MS.hist_dirty = false; save_persistence() end
+        if MS.disk_same(path) then return end
+    end
+    local data = try_load_json(path) or try_load_json(path .. ".bak")
     if not data then return end
+    MS.disk_mark(path)
     watch_history = U.plain(data.history)
     watched_set   = U.plain(data.watched)
     sort_by_dir   = U.plain(data.sort)
     index_meta    = U.plain(data.index)
     MS.hints      = U.plain(data.hints)
     MS.tracks     = U.plain(data.tracks)
+    MS.tracked    = U.plain(data.tracked)
+    MS.rev        = tonumber(data.rev) or MS.rev
     if mark_continue_dirty then mark_continue_dirty() end
     if browser_active then render() end
 end
 -- Hand-over: the instance that loses ownership writes once, then tells the new owner to re-read the file.
-mp.register_script_message("webdav-browser-claim", function(who)
+mp.register_script_message("webdav-browser-claim", function(who, how)
     if who == mp.get_script_name() then return end
+    if how == "startup" and tostring(mp.get_script_name()) > tostring(who) then return end
     if MS.active then
         pcall(save_persistence, true)
         MS.active = false
@@ -4370,16 +5251,24 @@ end)
 mp.register_script_message("webdav-browser-reload", function() if MS.active then reload_user_data() end end)
 
 open_browser = function()
-    if browser_active then close_browser(); return end
+    if browser_active then MS.XE.dismiss(); return end
+    local owner = MS.active
     MS.active = true
-    reload_user_data()
+    reload_user_data(owner ~= false)
     mp.commandv("script-message", "webdav-browser-claim", mp.get_script_name())
     if o.url == "" then
         mp.osd_message("webdav-browser: set url= in webdav-browser.conf", 4)
         return
     end
 
+    MS.logo(false)
+    MS.osc(true)
     browser_active = true
+    MS.nodrag(true)
+    if MS.ts_follow then MS.ts_follow(true) end
+    -- uosc draws its timeline / controls / top bar over the browser when the mouse comes near them and takes those
+    -- clicks; they are switched off while the browser is open (a broadcast: nothing happens without uosc)
+    mp.commandv("script-message", "disable-elements", mp.get_script_name(), "timeline,controls,volume,top_bar,window_border,idle_indicator,pause_indicator,buffering_indicator,audio_indicator")
     root_href = (o.start_path ~= "" and o.start_path or "/")
     tree = {}
     root_children = {}
@@ -4402,8 +5291,11 @@ open_browser = function()
     load_root()
     render()
     IDX.maybe_autostart()
+    IDX.resume()            -- a crawl that waited while a file played goes on now the browser is open
     if o.config_poll_secs and o.config_poll_secs > 0 then
-        MS.conf_timer = mp.add_periodic_timer(o.config_poll_secs, reload_config)
+        MS.conf_timer = mp.add_periodic_timer(o.config_poll_secs, function()
+            if MS.conf_stamp() ~= MS.conf_sig then reload_config() end
+        end)
     end
 end
 
@@ -4425,6 +5317,20 @@ end
 mp.observe_property("time-pos", "number", function(_, v) if v then last_known_pos = v end end)
 mp.observe_property("duration", "number", function(_, v) if v then last_known_dur = v end end)
 
+-- Remember "what comes after this episode" in the history file itself, so Continue Watching does not depend on
+-- the folder listing still being cached (same as the poster edition).
+function MS.note_next_hint(href)
+    local d = U.dirname(href)
+    local nx = find_next_media_href(href)
+    if nx then
+        MS.hints[d] = { href = nx.href, name = nx.name, size = nx.size, ts = os.time() }
+    elseif MS.hints[d] then
+        MS.hints[d].ts = os.time()
+    else
+        MS.hints[d] = { ts = os.time() }
+    end
+end
+
 -- Records progress for a file. Returns true if something was stored.
 --   * past watched_threshold_pct / within watched_tail_secs of the end -> watched
 --   * otherwise only counts as "in progress" after watch_min_secs AND watch_min_pct, so merely
@@ -4433,17 +5339,23 @@ local function record_progress(meta, pos, dur)
     if meta and meta.finished and dur then pos = dur end        -- left through the "Next episode" card: watched
     if not (meta and pos and dur and dur > 0) then return false end
     local pct = pos / dur * 100
+    local prev = watch_history[meta.href]
     if pos >= dur - o.watched_tail_secs or pct >= o.watched_threshold_pct then
+        if watched_set[meta.href] and not prev then return false end       -- watched already: nothing new
         watched_set[meta.href] = os.time()
         watch_history[meta.href] = nil
     elseif pos >= o.watch_min_secs and pct >= o.watch_min_pct then
+        -- paused, or barely moved since the last snapshot: nothing new to keep (and no new "last played" either)
+        if prev and prev.pos and math.abs(prev.pos - pos) < 5 and prev.duration == dur then return false end
         watch_history[meta.href] = {
             pos = pos, duration = dur, name = meta.name, dirpath = meta.dirpath, last_played = os.time(),
         }
     else
         return false
     end
+    if watched_set[meta.href] then MS.note_next_hint(meta.href) end
     mark_continue_dirty()
+    MS.prog_dirty = true
     return true
 end
 
@@ -4455,6 +5367,7 @@ end
 -- mpv forgets the "path" of an entry that fails to open, so remember what it started loading.
 mp.register_event("start-file", function()
     MS.starting_path = mp.get_property("path")
+    MS.cur_path = nil
 end)
 
 -- ============================================================
@@ -4556,15 +5469,24 @@ mp.register_event("file-loaded", function()
     -- A blur filter must never outlive the browser: if one is still in the chain while the browser is
     -- closed (e.g. the previous file ended with the browser open), the new video would look soft/low-res.
     if not browser_active and blur_in_chain() then remove_background_blur() end
-    if close_pending_for and path == close_pending_for then
-        close_pending_for = nil
+    if close_pending_for and (path == close_pending_for or (MS.close_t and mp.get_time() - MS.close_t < 45)) then
+        close_pending_for, MS.close_t = nil, nil
         if browser_active then close_browser() end
     end
     clear_start_over()
-    if MS.fb.active and path ~= MS.fb.local_url then MS.fb_stop(true) end
+    MS.cur_path = path
+    if MS.fb.active and path ~= MS.fb.local_url then
+        if not MS.fb.playing and MS.fb.pl_id and mp.get_time() - (MS.fb.t_start or 0) < 3 then
+            mp.commandv("stop", "keep-playlist")       -- mpv moved on by itself: the download plays in the failed one's place
+            return
+        end
+        MS.fb_stop(true)
+    end
     local meta = path and pending_meta[path]
+    if meta then meta.finished = nil end           -- (set when it was left through the Up next card)
     now_playing = meta
     pcall(MS.tracks_apply, meta)
+    if meta and meta.name then status_line = "Playing: " .. meta.name end     -- also when the playlist moves on
     last_known_pos, last_known_dur = nil, nil
     if meta then
         retry_counts[meta.href] = nil              -- it opened fine: reset the retry budget
@@ -4574,16 +5496,20 @@ mp.register_event("file-loaded", function()
             pcall(mp.set_property_number, "time-pos", rec.pos)
             if o.resume_notice then
                 local key = tostring(o.start_over_key or "b")
-                mp.osd_message(string.format("Resumed at %s   -   press %s to start over",
-                    U.fmt_time(rec.pos), key:upper()), o.resume_notice_secs)
+                MS.say_np({ eyebrow = "RESUMED AT", title = U.fmt_time(rec.pos), extra = key:upper() .. "  start over", key = "resume" }, o.resume_notice_secs,
+                    function(left)
+                        if MS.resume_timer then MS.resume_timer:kill() end
+                        MS.resume_timer = mp.add_timeout(left, clear_start_over)
+                    end)
                 safe_bind("webdav_startover", key, function()
+                    MS.np_gen = (MS.np_gen or 0) + 1
                     clear_start_over()
                     pcall(mp.set_property_number, "time-pos", 0)
                     watch_history[meta.href] = nil
                     mark_continue_dirty()
-                    mp.osd_message("Starting from the beginning", 2)
+                    MS.say({ eyebrow = "FROM THE START", title = "Starting from the beginning", key = "resume" }, 2.5)
                 end, ONCE)
-                MS.resume_timer = mp.add_timeout(o.resume_notice_secs, clear_start_over)
+                MS.resume_timer = mp.add_timeout(o.resume_notice_secs + 3, clear_start_over)    -- until the pill shows
             end
         end
     end
@@ -4591,10 +5517,13 @@ end)
 
 mp.register_event("end-file", function(event)
     clear_start_over()
+    MS.np_gen = (MS.np_gen or 0) + 1
     local meta = now_playing
 
     local fb = MS.fb
-    local was_local = fb.active and fb.local_url and mp.get_property("path") == fb.local_url
+    local ended = MS.cur_path or MS.starting_path
+    MS.cur_path = nil
+    local was_local = fb.active and fb.local_url and ended == fb.local_url
     if was_local then
         -- The growing local file ran dry (download slower than playback) or ended: reopen it where we were.
         if not fb.done and (fb.restarts or 0) < 30 and event.reason ~= "quit" and event.reason ~= "stop" then
@@ -4605,30 +5534,35 @@ mp.register_event("end-file", function(event)
         -- fall back to the entry mpv was loading.
         local failed = meta
         if not failed then
-            local pth = mp.get_property("path") or MS.starting_path
-            failed = (pth and pending_meta[pth]) or loading_meta
+            failed = ended and pending_meta[ended]
+            if not failed and loading_meta and ended and ended == file_stream_url(loading_meta.href) then failed = loading_meta end
         end
         if failed then
             local attempts = (retry_counts[failed.href] or 0) + 1
             retry_counts[failed.href] = attempts
             if o.fallback_download and attempts >= (tonumber(o.fallback_after_failures) or 1) and MS.fb_start(failed, "stream failed") then
                 retry_counts[failed.href] = nil
-                mp.osd_message("Streaming failed - downloading the file instead...", 4)
+                loading_meta = nil
+                MS.fb.pl_id, MS.fb.t_start = event.playlist_entry_id, mp.get_time()
+                if (mp.get_property_number("playlist-count") or 0) > 1 then mp.commandv("stop", "keep-playlist") end
+                MS.say({ eyebrow = "STREAMING FAILED", title = "Downloading the file instead" }, 4)
             elseif attempts <= o.max_retries then
                 local retry_url = file_stream_url(failed.href)
                 pending_meta[retry_url] = failed
                 loading_meta = failed
-                mp.osd_message(string.format("Retrying %s (%d/%d)", failed.name, attempts, o.max_retries), 3)
+                MS.say({ eyebrow = string.format("RETRYING  %d/%d", attempts, o.max_retries), title = failed.name, key = "retry" }, 3)
                 mp.add_timeout(o.retry_delay, function() queue_load(retry_url, "insert-next-play", failed.name) end)
             else
                 retry_counts[failed.href] = nil
-                mp.osd_message("Failed: " .. failed.name .. (event.file_error and (" (" .. tostring(event.file_error) .. ")") or ""), 5)
+                loading_meta = nil
+                MS.say({ eyebrow = "COULDN'T PLAY", title = failed.name, kind = "err", key = "retry",
+                    extra = string.format("tried %d times%s", (tonumber(o.max_retries) or 0) + 1, event.file_error and ("  ·  " .. tostring(event.file_error)) or "") }, 7)
             end
         end
     end
 
     if meta and not MS.active then reload_user_data() end     -- never overwrite the owner's newer data with ours
-    if meta and record_progress(meta, last_known_pos, last_known_dur) then
+    if meta and (record_progress(meta, last_known_pos, last_known_dur) or MS.prog_dirty) then
         save_persistence(true)
         if not MS.active then pcall(mp.commandv, "script-message", "webdav-browser-reload") end
     end
@@ -4638,7 +5572,8 @@ mp.register_event("end-file", function(event)
     if browser_active then render() end
 end)
 
--- Periodic watch-progress snapshot (memory every 15 s, disk at most once a minute)
+-- Periodic watch-progress snapshot: memory every 15 s, the disk at most once a minute (and at once when a file ends
+-- or mpv quits). Paused, nothing changes, so nothing is written.
 mp.add_periodic_timer(15, function()
     if now_playing and record_progress(now_playing, last_known_pos, last_known_dur) then
         debounced_save_persistence(60)
@@ -4650,8 +5585,7 @@ end)
 mp.add_periodic_timer(o.prefetch_check_interval_secs or 5, function()
     if not now_playing or not now_playing.next_item or now_playing.next_queued then return end
 
-    local pos = mp.get_property_number("time-pos")
-    local dur = mp.get_property_number("duration")
+    local pos, dur = last_known_pos, last_known_dur        -- watched values (a direct read waits on a busy mpv)
     if not (pos and dur and dur > 0) then return end
 
     local threshold = math.max(0, math.min(100, tonumber(o.prefetch_threshold_pct) or 75)) / 100
@@ -4680,17 +5614,24 @@ mp.add_periodic_timer(o.prefetch_check_interval_secs or 5, function()
     if browser_active then render() end
 end)
 
+-- Spinner: 8 frames a second while something you asked for loads. When only the background crawl is busy (its
+-- "indexing" counter in the header) it turns twice a second, so a long crawl no longer redraws the whole browser
+-- 8 times a second. Nothing at all while the browser is closed.
 mp.add_periodic_timer(0.12, function()
-    if browser_active and (is_loading or IDX.running) then
-        spinner_idx = (spinner_idx % #spinner_frames) + 1
-        render()
+    if not browser_active then return end
+    if not is_loading then
+        if not IDX.running then return end
+        IDX.spin = (IDX.spin or 0) + 1
+        if IDX.spin % 4 ~= 0 then return end
     end
+    spinner_idx = (spinner_idx % #spinner_frames) + 1
+    render()
 end)
 
--- Every 4 s while the browser is open: re-list the folders you are looking at that are still filling up, and give
--- each one a second look 5 s after its first listing this session (that is how a growing folder is noticed).
+-- Every 3 s while the browser is open: re-list the folders you are looking at that are still filling up, and give
+-- each one a second look 3 s after its first listing this session (that is how a growing folder is noticed).
 MS.inview = MS.inview or function() return { current_path } end
-mp.add_periodic_timer(4, function()
+mp.add_periodic_timer(3, function()
     if not browser_active then return end
     local ok, list = pcall(MS.inview)
     if not ok or type(list) ~= "table" then return end
@@ -4699,7 +5640,7 @@ mp.add_periodic_timer(4, function()
         local c = href and find_cached_dir(href)
         if c and type(c.entries) == "table" and not MS.inflight[href] then
             local again = MS.grow[href] ~= nil
-            if not again and (MS.seen[href] or 0) == 1 and now - (c.ts or now) >= 5 then again = true end
+            if not again and (MS.seen[href] or 0) == 1 and now - (c.ts or now) >= 3 then again = true end
             if again then fetch_listing(href, { silent = true }) end
         end
     end
@@ -4755,7 +5696,8 @@ end
 
 -- Start of the trailing ED / credits / preview chapters (nil when the file has none in its second half).
 function NX.tail_start(dur, skipper)
-    local list = mp.get_property_native("chapter-list") or {}
+    local list = MS.prop("chapter-list")
+    if type(list) ~= "table" then list = {} end
     local n = #list
     if n < 2 then return nil end
     local named = false
@@ -4780,18 +5722,20 @@ function NX.tail_start(dur, skipper)
 end
 
 function NX.next_entry()
-    local pos = mp.get_property_number("playlist-pos")
-    local pl = mp.get_property_native("playlist")
+    local pos = MS.prop("playlist-pos")
+    local pl = MS.prop("playlist")
     if not (pos and type(pl) == "table") then return nil end
     local nx = pl[pos + 2]           -- playlist-pos is 0-based, Lua tables 1-based
     return nx and pending_meta[nx.filename]
 end
 
 function NX.hide()
+    NX.last = nil
     if NX.shown then
         if NX.ov then NX.ov.data = ""; NX.ov:update() end
         pcall(mp.commandv, "overlay-remove", tostring(NX.id))
         NX.shown, NX.bmp = nil, nil
+        NX.GL.hide("nx")
     end
     if NX.bound then
         for _, k in ipairs(NX.keys) do pcall(mp.remove_key_binding, "webdav_nx_" .. k) end
@@ -4817,70 +5761,426 @@ function NX.bind(href)
 end
 
 -- Label ("S02E28"), episode name and show for the card: the title page's TMDB data when known, else the file name.
+-- ---- glass (vo=gpu-next): the same blur as the poster edition, for the cards below ----
+NX.GL = { owner = nil, sig = nil, dims = {}, slots = {}, N = 4, k = 36 }
+-- the tint over the glass: one look for every glass card (the blurred video under it, else the same card darker)
+NX.GL.TINT, NX.GL.SOLID = 46, 86
+mp.observe_property("osd-dimensions", "native", function(_, v) if type(v) == "table" then NX.GL.dims = v end end)
+NX.GL.FILE = "glass_v2.glsl"          -- (26.11: up to 4 cards blurred at once; v1 had one)
+NX.GL.SHADER = [==[
+// webdav-browser glass: blurs the video behind its on-screen cards (next episode, now playing, toasts, the
+// help sheet...) - up to 4 at once, nothing else. Written by webdav-browser-posters.lua; both passes are skipped
+// while no card is shown.
+//!PARAM wb_on
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM wb_0x0
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_0y0
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_0x1
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_0y1
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_0r
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 500.0
+0.0
+
+//!PARAM wb_1x0
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_1y0
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_1x1
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_1y1
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_1r
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 500.0
+0.0
+
+//!PARAM wb_2x0
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_2y0
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_2x1
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_2y1
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_2r
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 500.0
+0.0
+
+//!PARAM wb_3x0
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_3y0
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_3x1
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_3y1
+//!TYPE DYNAMIC float
+//!MINIMUM -1.0
+//!MAXIMUM 2.0
+-1.0
+
+//!PARAM wb_3r
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 500.0
+0.0
+
+//!PARAM wb_k
+//!TYPE DYNAMIC float
+//!MINIMUM 1.0
+//!MAXIMUM 200.0
+36.0
+
+//!PARAM wb_sat
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 3.0
+1.4
+
+//!HOOK OUTPUT
+//!BIND HOOKED
+//!SAVE WBGLASS
+//!WHEN wb_on
+//!DESC webdav-browser glass (horizontal)
+bool wb_near(vec2 p, vec2 a, vec2 b) {
+    return !(p.y < a.y - wb_k - 2.0 || p.y > b.y + wb_k + 2.0 || p.x < a.x - 2.0 || p.x > b.x + 2.0);
+}
+vec4 hook() {
+    vec2 p = HOOKED_pos * HOOKED_size;
+    if (!(wb_near(p, vec2(wb_0x0, wb_0y0) * HOOKED_size, vec2(wb_0x1, wb_0y1) * HOOKED_size) ||
+        wb_near(p, vec2(wb_1x0, wb_1y0) * HOOKED_size, vec2(wb_1x1, wb_1y1) * HOOKED_size) ||
+        wb_near(p, vec2(wb_2x0, wb_2y0) * HOOKED_size, vec2(wb_2x1, wb_2y1) * HOOKED_size) ||
+        wb_near(p, vec2(wb_3x0, wb_3y0) * HOOKED_size, vec2(wb_3x1, wb_3y1) * HOOKED_size)))
+        return HOOKED_tex(HOOKED_pos);
+    float s = wb_k / 12.0;
+    vec4 acc = vec4(0.0);
+    float wsum = 0.0;
+    for (int i = -12; i <= 12; i++) {
+        float x = float(i);
+        float w = exp(-x * x / 50.0);
+        acc += HOOKED_tex(HOOKED_pos + vec2(x * s, 0.0) * HOOKED_pt) * w;
+        wsum += w;
+    }
+    return acc / wsum;
+}
+
+//!HOOK OUTPUT
+//!BIND HOOKED
+//!BIND WBGLASS
+//!WHEN wb_on
+//!DESC webdav-browser glass (vertical)
+float wb_sdf(vec2 p, vec2 a, vec2 b, float r) {
+    vec2 q = abs(p - (a + b) * 0.5) - (b - a) * 0.5 + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+vec4 hook() {
+    vec4 c = HOOKED_tex(HOOKED_pos);
+    vec2 p = HOOKED_pos * HOOKED_size;
+    float d = 1.0e9;
+    d = min(d, wb_sdf(p, vec2(wb_0x0, wb_0y0) * HOOKED_size, vec2(wb_0x1, wb_0y1) * HOOKED_size, wb_0r));
+    d = min(d, wb_sdf(p, vec2(wb_1x0, wb_1y0) * HOOKED_size, vec2(wb_1x1, wb_1y1) * HOOKED_size, wb_1r));
+    d = min(d, wb_sdf(p, vec2(wb_2x0, wb_2y0) * HOOKED_size, vec2(wb_2x1, wb_2y1) * HOOKED_size, wb_2r));
+    d = min(d, wb_sdf(p, vec2(wb_3x0, wb_3y0) * HOOKED_size, vec2(wb_3x1, wb_3y1) * HOOKED_size, wb_3r));
+    if (d > 1.0)
+        return c;
+    float s = wb_k / 12.0;
+    vec4 acc = vec4(0.0);
+    float wsum = 0.0;
+    for (int i = -12; i <= 12; i++) {
+        float y = float(i);
+        float w = exp(-y * y / 50.0);
+        acc += WBGLASS_tex(WBGLASS_pos + vec2(0.0, y * s) * WBGLASS_pt) * w;
+        wsum += w;
+    }
+    vec3 bl = (acc / wsum).rgb;
+    float l = dot(bl, vec3(0.2126, 0.7152, 0.0722));
+    bl = max(mix(vec3(l), bl, wb_sat), 0.0);
+    return vec4(mix(c.rgb, bl, clamp(0.5 - d, 0.0, 1.0)), c.a);
+}
+]==]
+
+-- the shader is in place (written once to the cache folder, appended to glsl-shaders): true / false
+function NX.GL.ready()
+    local G = NX.GL
+    if not o.glass_blur or G.bad then return false end
+    if MS.prop("current-vo") ~= "gpu-next" then return false end
+    -- still in the list? (a shader-switching script may have replaced glsl-shaders: then it is added again)
+    local list = MS.prop("glsl-shaders")
+    if G.loaded and G.list == list then return true end
+    for _, s in ipairs(type(list) == "table" and list or {}) do
+        if tostring(s):find(G.FILE, 1, true) then G.loaded, G.list = true, list; return true end
+    end
+    local dir = data_dir()
+    if not dir then G.bad = true; return false end
+    local path = dir .. "/" .. G.FILE
+    if not G.written and not utils.file_info(path) then
+        local f = io.open(path, "wb")
+        if not f then G.bad = true; return false end
+        f:write(G.SHADER); f:close()
+    end
+    G.written = true
+    if G.loaded then G.sig = nil end       -- it was taken out: back in, and its values set again
+    G.loaded = mp.commandv("change-list", "glsl-shaders", "append", path) and true or false
+    if not G.loaded then G.bad = true; msg.warn("glass: could not load the blur shader " .. path) end
+    MS.P["glsl-shaders"], MS.Pq["glsl-shaders"], G.list = nil, nil, nil     -- the next look reads the new list once (it holds the shader)
+    return G.loaded
+end
+-- blur behind window rectangle x1,y1-x2,y2 (corner radius r) for this card (owner): true when the blur is on. Each
+-- card has a slot of its own (4), so a toast, the Now playing card and the help sheet are all glass at the same time
+function NX.GL.show(owner, x1, y1, x2, y2, r, S)
+    local G = NX.GL
+    if not G.ready() then return false end
+    local d = G.dims
+    local ml, mt = tonumber(d.ml) or 0, tonumber(d.mt) or 0
+    local vw = (tonumber(d.w) or 0) - ml - (tonumber(d.mr) or 0)
+    local vh = (tonumber(d.h) or 0) - mt - (tonumber(d.mb) or 0)
+    if vw < 16 or vh < 16 then G.hide(owner); return false end
+    local sl = G.slots[owner]
+    if not sl then
+        local used = {}
+        for _, v in pairs(G.slots) do used[v.i] = true end
+        local free
+        for i = 0, G.N - 1 do if not used[i] then free = i; break end end
+        if not free then return false end           -- (all slots taken: this card is tinted instead)
+        sl = { i = free }
+        G.slots[owner] = sl
+    end
+    sl.v = { (x1 - ml) / vw, (y1 - mt) / vh, (x2 - ml) / vw, (y2 - mt) / vh, r }
+    sl.k = math.max(8, 30 * (S or 1))
+    G.owner = owner
+    G.push()
+    return true
+end
+-- every slot's values in ONE write: each write of glsl-shader-opts makes mpv reset its renderer (a dropped frame,
+-- HDR peak detection starting over), so the cards also only move it when they come to rest
+function NX.GL.push()
+    local G = NX.GL
+    local by, k = {}, 8
+    for _, v in pairs(G.slots) do by[v.i] = v; k = math.max(k, v.k or 8) end
+    local parts = {}
+    for i = 0, G.N - 1 do
+        local v = by[i] and by[i].v or { -1, -1, -1, -1, 0 }
+        parts[#parts + 1] = string.format("wb_%dx0=%.4f,wb_%dy0=%.4f,wb_%dx1=%.4f,wb_%dy1=%.4f,wb_%dr=%.4f", i, v[1], i, v[2], i, v[3], i, v[4], i, v[5])
+    end
+    parts[#parts + 1] = string.format("wb_k=%.4f,wb_sat=1.4500,wb_on=1.0000", k)
+    local sig = table.concat(parts, ",")
+    if sig ~= G.sig then
+        G.sig = sig
+        G.put(sig)
+    end
+end
+-- several values in one write: "add" takes them all on mpv 0.41; older versions warn about it in the terminal, so there
+-- the whole list (anyone else's values kept) is set in one go instead
+function NX.GL.put(s)
+    local G = NX.GL
+    if G.multi == nil then
+        local a, b = tostring(mp.get_property("mpv-version") or ""):match("(%d+)%.(%d+)")
+        G.multi = (tonumber(a) or 0) > 0 or (tonumber(b) or 0) >= 41
+    end
+    if G.multi then mp.commandv("change-list", "glsl-shader-opts", "add", s); return end
+    local cur = mp.get_property_native("glsl-shader-opts")
+    if type(cur) ~= "table" then cur = {} end
+    for k, v in s:gmatch("([%w_]+)=([^,]+)") do cur[k] = v end
+    mp.set_property_native("glsl-shader-opts", cur)
+end
+function NX.GL.hide(owner)
+    local G = NX.GL
+    if owner == nil or not G.slots[owner] then return end
+    G.slots[owner] = nil
+    if next(G.slots) == nil then
+        G.owner, G.sig = nil, nil
+        G.put("wb_on=0")
+    else
+        if G.owner == owner then G.owner = next(G.slots) end
+        G.push()
+    end
+end
+-- the card body: a soft shadow, tinted glass and a hairline edge
+function NX.GL.frame(ev, x1, y1, x2, y2, rad, S, glass)
+    local b = math.max(6, math.floor(14 * S))
+    ev[#ev + 1] = string.format("{\\an7\\pos(0,0)\\bord0\\shad0\\blur%d\\1c&H000000&\\1a%s\\3a&HFF&\\p1}%s{\\p0}",
+        b, U.ass_alpha(glass and 22 or 30), D.rounded_path(x1, y1 + b * 0.35, x2, y2 + b * 0.6, rad))
+    ev[#ev + 1] = D.ev_rect(x1, y1, x2, y2, TOAST.fill, glass and NX.GL.TINT or NX.GL.SOLID, TOAST.edge, 17, math.max(1, math.floor(S + 0.5)), rad)
+end
+-- text in white at an opacity (0-100)
+function NX.GL.txt(x, y, an, fs, op, bold, s)
+    return D.ev_text(x, y, an, string.format("\\fs%d\\b%d\\c%s\\1a%s", fs, bold and 1 or 0, U.ass_color(TOAST.text), U.ass_alpha(op)), s)
+end
+-- a ring (frac 0-1 of it, clockwise from the top) for the countdown
+function NX.GL.arc(cx, cy, r, th, frac, rgb, op)
+    frac = math.max(0, math.min(0.9999, frac))
+    if frac <= 0 then return "" end
+    local n = math.max(6, math.ceil(72 * frac))
+    local outer, inner = {}, {}
+    for i = 0, n do
+        local a = -math.pi / 2 + 2 * math.pi * frac * i / n
+        local c, s = math.cos(a), math.sin(a)
+        outer[#outer + 1] = string.format("%d %d", D.rd(cx + r * c), D.rd(cy + r * s))
+        inner[#inner + 1] = string.format("%d %d", D.rd(cx + (r - th) * c), D.rd(cy + (r - th) * s))
+    end
+    local rev = {}
+    for i = #inner, 1, -1 do rev[#rev + 1] = inner[i] end
+    local path = "m " .. outer[1] .. " l " .. table.concat(outer, " ", 2) .. " " .. table.concat(rev, " ")
+    return string.format("{\\an7\\pos(0,0)\\bord0\\shad0\\blur0.6\\1c%s\\1a%s\\3a&HFF&\\p1}%s{\\p0}", U.ass_color(rgb), U.ass_alpha(op), path)
+end
+
+
 function NX.info(meta)
     local em = MS.ep_meta[meta.href] or {}
     local cp = CT.parse(meta.name or "")
-    local name = em.name or (cp and cp.ep) or (cp and cp.title) or meta.name or ""
-    return em.label or (cp and cp.se), name
+    return em.label or (cp and cp.se), em.name or (cp and cp.ep), em.show or (cp and cp.title)
 end
-
-function NX.draw(meta, left, sw, sh, f)
-    local ww, wh = mp.get_osd_size()
-    if not ww or ww <= 0 then return end
-    NX.ov = NX.ov or mp.create_osd_overlay("ass-events")
-    local S = wh / 1080
-    local fs = math.max(14, math.floor(21 * S))
-    local pad = math.floor(14 * S)
-    local has_still = sw > 0
-    local tw = has_still and math.floor(sw * 1.15) or math.floor(wh * 0.30)     -- text column (beside the still)
-    local pw = (has_still and (sw + pad) or 0) + tw + 2 * pad
-    local ph = math.max(has_still and sh or 0, math.floor(fs * 6.4)) + 2 * pad
-    local x1 = ww - pw - math.floor(40 * S)
-    local y1 = wh - ph - math.floor(100 * S)
-    local sy = y1 + math.floor((ph - sh) / 2)                -- the still, centred vertically
-    local label, name = NX.info(meta)
-    local ev = {}
-    ev[#ev + 1] = D.ev_rect(x1, y1, x1 + pw, y1 + ph, THEME.bg_header, 92, THEME.accent, 55, 1, math.floor(12 * S))
-    if has_still and not f then ev[#ev + 1] = D.ev_rect(x1 + pad, sy, x1 + pad + sw, sy + sh, THEME.bg_panel, 100, nil, 0, 0, NX.radius or 0) end
-    local tx, ty = x1 + pad + (has_still and (sw + pad) or 0), y1 + pad
-    local function line(y, tags, txt) ev[#ev + 1] = D.ev_text(tx, y, 7, tags, txt) end
-    line(ty, string.format("\\b1\\fs%d\\c%s", fs + 3, U.ass_color("FFFFFF")), "Next episode in " .. math.max(0, math.ceil(left)))
-    local ny = ty + fs * 1.6
-    if label then
-        line(ny, string.format("\\b1\\fs%d\\c%s", fs, U.ass_color(THEME.accent)), U.ass_escape(label))
-        ny = ny + fs * 1.3
-    end
-    line(ny, string.format("\\fs%d\\c%s", fs, U.ass_color(THEME.text_primary)), U.ass_escape(U.fit_text(name, tw, fs)))
-    ev[#ev + 1] = D.ev_text(tx, y1 + ph - pad, 1, string.format("\\fs%d\\c%s", fs - 5, U.ass_color(THEME.text_muted)),
-        U.ass_escape(U.fit_text("Enter play  ·  Esc stay", tw, fs - 5)))
-    -- countdown bar along the bottom of the card
-    local frac = math.max(0, math.min(1, left / math.max(1, tonumber(o.next_episode_secs) or 10)))
-    local bh = math.max(3, math.floor(4 * S))
-    ev[#ev + 1] = D.ev_rect(x1 + pad, y1 + ph - bh - 2, x1 + pad + (pw - 2 * pad) * frac, y1 + ph - 2, THEME.accent, 100, nil, 0, 0, 2)
-    NX.ov.res_x, NX.ov.res_y = ww, wh
-    NX.ov.data = table.concat(ev, "\n")
-    NX.ov:update()
-    if f then
-        local bx, by = math.floor(x1 + pad), math.floor(sy)
-        local sig = f .. "@" .. bx .. "," .. by
-        if NX.bmp ~= sig then
-            NX.bmp = mp.commandv("overlay-add", tostring(NX.id), tostring(bx), tostring(by), f, "0", "bgra",
-                tostring(sw), tostring(sh), tostring(sw * 4)) and sig or nil
-        end
-    end
-    NX.shown = true
-end
-
-
--- list edition: no artwork, just the text
+-- list edition: no artwork - a compact glass card with the text and the countdown ring
 function NX.size() return 0, 0 end
-function NX.still() return nil end
+function NX.tw(s, fs, bold) return U.utf8_len(tostring(s or "")) * fs * (bold and 0.53 or 0.49) end
+-- Where a card or toast sits (next_card_position, now_playing_position, startup_toast_position): top-left, top,
+-- top-right, bottom-left, bottom, bottom-right ("top-center" / "center" also work). Bottom keeps clear of the timeline.
+NX.POS = { ["top-left"] = true, top = true, ["top-right"] = true, ["bottom-left"] = true, bottom = true, ["bottom-right"] = true, center = true }
+function NX.pos_name(v, def)
+    v = tostring(v or ""):lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("[%s_]+", "-"):gsub("centre", "center")
+    v = v:gsub("^top%-center$", "top"):gsub("^bottom%-center$", "bottom"):gsub("^middle$", "center")
+    return NX.POS[v] and v or def
+end
+function NX.corner(pos, cw, ch, S, def)
+    local ww, wh = U.canvas_size()
+    pos = NX.pos_name(pos, def)
+    local mx, mt, mb = math.floor(36 * S), math.floor(40 * S), math.floor(108 * S)
+    local x = pos:find("left") and mx or (pos:find("right") and (ww - cw - mx)) or math.floor((ww - cw) / 2)
+    local y = pos:find("^top") and mt or ((pos == "center") and math.floor((wh - ch) / 2)) or (wh - ch - mb)
+    return x, y, pos
+end
+function NX.card(which, spec)
+    local ww, wh = U.canvas_size()
+    if not ww or ww <= 0 then return end
+    local S = wh / 1080
+    local pad = math.floor(10 * S + 0.5)
+    local gap = math.floor(12 * S + 0.5)
+    local rad = math.floor(16 * S + 0.5)
+    local fs1, fs2, fs3 = math.max(11, math.floor(12 * S)), math.max(14, math.floor(18 * S)), math.max(11, math.floor(13 * S))
+    local rr = spec.frac and math.floor(19 * S + 0.5) or 0
+    local fsp = math.max(1, math.floor(S + 0.5))
+    local need = math.max(NX.tw(spec.title, fs2, true), NX.tw(spec.eyebrow, fs1, true) + U.utf8_len(spec.eyebrow or "") * fsp,
+        (spec.sub and spec.sub ~= "") and NX.tw(spec.sub, fs3) or 0)
+    local tw = math.floor(math.max(150 * S, math.min(270 * S, need + 4 * S)))
+    local title = (NX.tw(spec.title, fs2, true) <= tw) and (spec.title or "") or U.fit_text(spec.title or "", tw, fs2)
+    local ch = math.floor(64 * S + 0.5) + 2 * pad
+    local cw = pad + math.floor(10 * S) + tw + (rr > 0 and (gap + 2 * rr) or 0) + pad + math.floor(4 * S)
+    local x1, y1 = NX.corner(spec.pos, cw, ch, S, (spec.x == "left") and "bottom-left" or "bottom-right")
+    local x2, y2 = x1 + cw, y1 + ch
+    if which == "np" then
+        local r0 = NX.NP.rect
+        NX.NP.rect = { x1, y1, x2, y2 }
+        -- a toast beside the card follows it when it changes size
+        if r0 and (r0[2] ~= y1 or r0[3] ~= x2 or r0[4] ~= y2) and NX.TS.spec and NX.TS.spec.beside == "np" then NX.TS.draw() end
+    end
+    local glass = NX.GL.show(which, x1, y1, x2, y2, rad, S)
+    local ev = {}
+    NX.GL.frame(ev, x1, y1, x2, y2, rad, S, glass)
+    local tx, cy = x1 + pad + math.floor(10 * S), (y1 + y2) / 2
+    ev[#ev + 1] = NX.GL.txt(tx, cy - fs2 * 0.95, 4, fs1, 62, true, "{\\fsp" .. fsp .. "}" .. U.ass_escape(spec.eyebrow or ""))
+    ev[#ev + 1] = NX.GL.txt(tx, cy + fs2 * 0.05, 4, fs2, 100, true, U.ass_escape(title))
+    if spec.sub and spec.sub ~= "" then ev[#ev + 1] = NX.GL.txt(tx, cy + fs2 * 1.05, 4, fs3, 55, false, U.ass_escape((NX.tw(spec.sub, fs3) <= tw) and spec.sub or U.fit_text(spec.sub, tw, fs3))) end
+    if rr > 0 then
+        local rcx = x2 - pad - math.floor(4 * S) - rr
+        local th = math.max(2, math.floor(3 * S + 0.5))
+        ev[#ev + 1] = NX.GL.arc(rcx, cy, rr, th, 1, TOAST.text, 18)
+        ev[#ev + 1] = NX.GL.arc(rcx, cy, rr, th, spec.frac, TOAST.ring, 92)
+        ev[#ev + 1] = NX.GL.txt(rcx, cy, 5, fs2 - 1, 95, true, tostring(spec.count or ""))
+    end
+    local slot = (which == "np") and NX.NP or NX
+    slot.ov = slot.ov or mp.create_osd_overlay("ass-events")
+    slot.ov.res_x, slot.ov.res_y = ww, wh
+    -- the card is drawn again a few times a second; mpv only hears about it when something on it changed
+    local data = table.concat(ev, "\n")
+    local key = data .. "|" .. ww .. "x" .. wh
+    if not slot.shown or slot.last ~= key then slot.ov.data = data; slot.ov:update(); slot.last = key end
+    slot.shown = true
+end
+function NX.draw(meta, left)
+    local label, name, show = NX.info(meta)
+    local secs = math.max(1, tonumber(o.next_episode_secs) or 10)
+    NX.card("nx", { eyebrow = "UP NEXT" .. (label and ("  ·  " .. label) or ""), title = name or show or meta.name or "",
+        sub = "Enter play  ·  Esc stay", frac = math.max(0, math.min(1, left / secs)), count = math.max(0, math.ceil(left)),
+        pos = o.next_card_position })
+end
 
 mp.add_periodic_timer(0.2, function()
     if not o.next_episode_card or not now_playing or browser_active then NX.hide(); return end
     local href = now_playing.href
     if NX.dismissed and NX.dismissed ~= href then NX.dismissed = nil end
-    local pos, dur = mp.get_property_number("time-pos"), mp.get_property_number("duration")
+    local pos, dur = last_known_pos, last_known_dur
     if not (pos and dur and dur > 60) or NX.dismissed == href then NX.hide(); return end
     local secs = math.max(3, tonumber(o.next_episode_secs) or 10)
     local timing = tostring(o.next_episode_timing or "auto"):lower()
@@ -4894,8 +6194,6 @@ mp.add_periodic_timer(0.2, function()
     if pos < t0 - 90 then NX.hide(); return end
     local meta = NX.next_entry()
     if not meta then NX.hide(); return end
-    local sw, sh = NX.size()
-    local f = NX.still(meta, sw, sh)                 -- starts early, so the still is ready when the card appears
     if pos < t0 or pos >= dur - 0.3 then NX.hide(); return end
     local left = (t_go or (t0 + secs)) - pos
     if left <= 0 then
@@ -4903,9 +6201,60 @@ mp.add_periodic_timer(0.2, function()
         if t_go then NX.dismissed = href; NX.next() end
         return
     end
+    if NX.NP.shown then NX.NP.hide() end
     NX.bind(href)
-    NX.draw(meta, left, sw, sh, f)
+    NX.draw(meta, left)
 end)
+
+-- ---- now playing: a few seconds of the same card when a file starts from here ----
+NX.NP = { shown = nil, ov = nil, n = 0 }
+function NX.NP.hide()
+    NX.NP.rect, NX.NP.last = nil, nil
+    local P = NX.NP
+    P.n = P.n + 1
+    if P.shown then
+        if P.ov then P.ov.data = ""; P.ov:update() end
+        P.shown = nil
+    end
+    NX.GL.hide("np")
+end
+function NX.NP.start()
+    local P = NX.NP
+    P.hide()
+    if not o.now_playing_card then return end
+    local meta = pending_meta[mp.get_property("path") or ""]
+    if not (meta and meta.href) then return end
+    local n = P.n
+    local shown_at
+    local t0 = mp.get_time()
+    local function tick()
+        if P.n ~= n then return end
+        local now = mp.get_time()
+        -- the browser closes itself once playback has really started: wait for that (a moment), then show
+        if browser_active and not shown_at and now - t0 < 4 then mp.add_timeout(0.2, tick); return end
+        if browser_active or NX.shown or MS.prop("idle-active") then P.hide(); return end
+        shown_at = shown_at or now
+        if now - shown_at >= math.max(1, tonumber(o.now_playing_secs) or 4) then P.hide(); return end
+        local label, name, show = NX.info(meta)
+        local vp = MS.prop("video-params")
+        if type(vp) ~= "table" then vp = {} end
+        local hgt, wid = tonumber(vp.h) or 0, tonumber(vp.w) or 0       -- by width too: 1920x800 is a 1080p film
+        local res = ((wid >= 3200 or hgt >= 1600) and "2160p") or ((wid >= 1800 or hgt >= 900) and "1080p")
+            or ((wid >= 1200 or hgt >= 600) and "720p") or (hgt > 0 and (hgt .. "p")) or nil
+        local parts = {}
+        if show and name then parts[#parts + 1] = show end
+        if res then parts[#parts + 1] = res end
+        NX.card("np", { eyebrow = "NOW PLAYING" .. (label and ("  ·  " .. label) or ""), title = name or show or meta.name or "",
+            sub = table.concat(parts, "  ·  "), x = "left", pos = o.now_playing_position })
+        mp.add_timeout(0.25, tick)
+    end
+    mp.add_timeout(0.35, tick)
+end
+mp.register_event("file-loaded", function()
+    local ok, err = pcall(NX.NP.start)
+    if not ok then msg.warn("now-playing card: " .. tostring(err)) end
+end)
+mp.register_event("end-file", function() NX.NP.hide() end)
 
 mp.register_event("shutdown", function()
     index_stop()
@@ -4913,6 +6262,7 @@ mp.register_event("shutdown", function()
         if now_playing then record_progress(now_playing, last_known_pos, last_known_dur) end
         save_persistence()
         if MS.cache_dirty then save_dircache() end
+        MS.fold_journals()
     end
     if MS.fb.active then MS.fb_stop(true) end
     for pth in pairs(MS.fb_dirty_files) do pcall(os.remove, pth) end
@@ -4922,7 +6272,381 @@ mp.register_event("shutdown", remove_background_blur)
 
 MS.debug = o.debug_overlay
 MS.blur_state = "off"
+MS.conf_sig = MS.conf_stamp()           -- what the conf looked like when it was read at the start
 load_persistence()
-mp.commandv("script-message", "webdav-browser-claim", mp.get_script_name())   -- the script loaded last owns the data until the other one's key is used
+mp.commandv("script-message", "webdav-browser-claim", mp.get_script_name(), "startup")   -- at startup the poster edition keeps the data; afterwards the one opened last
 msg.info("webdav-browser " .. SCRIPT_VERSION .. " loaded (Ctrl+W)")
-mp.osd_message("webdav-browser " .. SCRIPT_VERSION .. " loaded", 2)
+-- ---- toasts: one glass pill (the look of the cards): "WEBDAV LIBRARY  Ready  Press Ctrl+W to browse" ----
+-- text width measured by libass (falls back to an estimate)
+NX.wc = {}
+function NX.sctw(str, fs, bold, fsp, ww, wh)
+    local key = table.concat({ str, fs, tostring(bold), fsp or 0, ww, wh }, "|")
+    if NX.wc[key] then return NX.wc[key] end
+    NX.mo = NX.mo or mp.create_osd_overlay("ass-events")
+    local mo = NX.mo
+    mo.res_x, mo.res_y, mo.hidden, mo.compute_bounds = ww, wh, true, true
+    mo.data = D.ev_text(0, wh / 2, 7, string.format("\\fs%d\\b%d%s", fs, bold and 1 or 0, fsp and ("\\fsp" .. fsp) or ""), U.ass_escape(str))
+    local ok, r = pcall(mo.update, mo)
+    local w = (ok and type(r) == "table" and r.x1) and (r.x1 - r.x0) or (U.utf8_len(str) * fs * (bold and 0.58 or 0.52) + (fsp or 0) * U.utf8_len(str))
+    NX.wc[key] = w
+    return w
+end
+
+-- ---------- the status card: one compact floating glass card for every wait ----------
+-- Real-Debrid preparing a release, a torrent buffering in rqbit, the download-while-playing fallback. A thin bar that
+-- eases to its value, a light band sweeping while there is no number yet, a soft glow breathing at the bar's front edge,
+-- a short shake when it fails; it slides in, and shrinks and fades away once playback starts (pulse=no: no motion).
+-- spec = { owner, eyebrow, title, line, line_rgb, frac (0-1, nil = no number yet), right ("34 %"), sub, keys, err }
+NX.SC = { ov = nil, timer = nil, spec = nil, t0 = 0, frac = 0, out = nil, last = 0 }
+-- text fitted to a width (… when cut), measured like the toasts
+function NX.scfit(s, max_px, fs, bold)
+    s = tostring(s or "")
+    local ww, wh = U.canvas_size()
+    if s == "" or NX.sctw(s, fs, bold, nil, ww, wh) <= max_px then return s end
+    local lo, hi = 1, U.utf8_len(s) - 1
+    local function cut(n) return ((U.utf8_sub(s, n):gsub("…$", ""):gsub("[%s%p]+$", ""))) .. "…" end
+    while lo < hi do
+        local mid = math.ceil((lo + hi) / 2)
+        if NX.sctw(cut(mid), fs, bold, nil, ww, wh) <= max_px then lo = mid else hi = mid - 1 end
+    end
+    return cut(lo)
+end
+function NX.SC.moving() return o.pulse ~= false and o.animations ~= false end
+function NX.SC.show(spec)
+    local C = NX.SC
+    if not spec then return C.hide() end
+    local now = mp.get_time()
+    if not C.spec or C.out then C.t0, C.out, C.frac = now, nil, spec.frac or 0 end
+    if spec.err and not (C.spec and C.spec.err) then C.err_t = now end
+    if not spec.err then C.err_t = nil end
+    C.spec = spec
+    if spec.secs then C.till = now + spec.secs else C.till = nil end
+    -- mpv's idle logo would sit right behind a centred card: hidden while it shows
+    if not browser_active and not C.logo and MS.prop("idle-active") and MS.logo then
+        C.logo = true; MS.logo(false)
+        mp.commandv("script-message", "disable-elements", mp.get_script_name() .. "-card", "idle_indicator")     -- uosc's logo
+    end
+    C.draw()
+    C.pace()
+end
+-- the card's frames: 60 a second while something moves, 24 while only the bar's glow breathes
+function NX.SC.pace()
+    local C = NX.SC
+    if not C.spec or not NX.SC.moving() then return end
+    local fps = C.fast and 60 or 24
+    if C.timer and C.fps ~= fps then C.timer:kill(); C.timer = nil end
+    if not C.timer then C.timer, C.fps = mp.add_periodic_timer(1 / fps, function() C.draw(); C.pace() end), fps end
+end
+-- playback is starting: the card shrinks and fades away
+function NX.SC.done(owner)
+    local C = NX.SC
+    if not C.spec or (owner and C.spec.owner ~= owner) then return end
+    if not NX.SC.moving() then return C.hide() end
+    if not C.out then C.out = mp.get_time() end
+    C.fast = true
+    C.pace()
+end
+function NX.SC.hide(owner)
+    local C = NX.SC
+    if owner and (not C.spec or C.spec.owner ~= owner) then return end
+    if C.timer then C.timer:kill(); C.timer = nil end
+    C.spec, C.out, C.rest, C.glass_t = nil, nil, nil, nil
+    if C.ov then C.ov.data = ""; C.ov:update() end
+    if C.logo then
+        C.logo = nil
+        if not browser_active and MS.logo then MS.logo(true) end
+        mp.commandv("script-message", "disable-elements", mp.get_script_name() .. "-card", "")
+    end
+    NX.GL.hide("sc")
+end
+function NX.SC.draw()
+    local C = NX.SC
+    local sp = C.spec
+    if not sp then return C.hide() end
+    local now = mp.get_time()
+    if C.till and now > C.till and not C.out then C.out = now end
+    local ww, wh = U.canvas_size()
+    local S = wh / 1080
+    local moving = NX.SC.moving()
+    local function ease(k) k = math.max(0, math.min(1, k)); return 1 - (1 - k) ^ 3 end
+    local ain = moving and ease((now - C.t0) / 0.28) or 1
+    local a, scale = ain, 1
+    if C.out then
+        local k = (now - C.out) / 0.32
+        if k >= 1 then return C.hide() end
+        a, scale = ain * (1 - ease(k)), 1 - 0.07 * ease(k)
+    end
+    -- the bar eases to its value instead of jumping once a second
+    local dt = math.min(0.1, now - (C.last or now))
+    C.last = now
+    if sp.frac then
+        local tgt = math.max(0, math.min(1, sp.frac))
+        C.frac = moving and (C.frac + (tgt - C.frac) * math.min(1, dt * 7)) or tgt
+        if math.abs(tgt - C.frac) < 0.001 then C.frac = tgt end
+    end
+    local fs1, fs2, fs3, fs4 = math.max(10, math.floor(12 * S)), math.max(13, math.floor(18 * S)),
+        math.max(11, math.floor(14 * S)), math.max(10, math.floor(12.5 * S))
+    local pad = math.floor(18 * S)
+    local fsp = math.max(1, math.floor(S + 0.5))
+    local cw = math.floor(math.min(ww - 40 * S, 560 * S) * scale)
+    local bar_h = math.max(3, math.floor(4 * S + 0.5))
+    local gap = math.floor(9 * S)
+    local ch = pad + fs1 + gap + fs2 + math.floor(gap * 0.7) + fs3 + gap + bar_h + (sp.sub and (gap + fs4) or 0)
+        + (sp.keys and (gap + fs4) or 0) + pad
+    ch = math.floor(ch * scale)
+    local x1, y1, pos = NX.corner(sp.pos or o.download_card_position, cw, ch, S, "center")
+    local rest = (not C.out and ain >= 1) and { x1, y1, cw, ch } or C.rest         -- where the glass sits
+    if not C.out then C.rest = rest; y1 = y1 + (1 - ain) * 14 * S * ((pos or ""):find("^top") and -1 or 1) end
+    if C.err_t and moving then
+        local k = now - C.err_t
+        if k < 0.45 then x1 = x1 + math.sin(k * 42) * 7 * S * (1 - k / 0.45) end
+    end
+    local x2, y2 = x1 + cw, y1 + ch
+    local rad = math.floor(18 * S)
+    -- the blurred video behind it comes on once the card has arrived and stays there (moving it with the card would
+    -- reset mpv's renderer every frame); the tint thins out over it so it does not pop (at once without animations)
+    local glass = rest and (not browser_active) and NX.GL.show("sc", rest[1], rest[2], rest[1] + rest[3], rest[2] + rest[4], rad, S)
+    if glass and not C.glass_t then C.glass_t = now end
+    if not glass then C.glass_t = nil end
+    local thin = glass and (moving and math.min(1, (now - C.glass_t) / 0.2) or 1) or 0
+    local ev = {}
+    local b = math.max(6, math.floor(16 * S))
+    ev[#ev + 1] = string.format("{\\an7\\pos(0,0)\\bord0\\shad0\\blur%d\\1c&H000000&\\1a%s\\3a&HFF&\\p1}%s{\\p0}",
+        b, U.ass_alpha(30 * a), D.rounded_path(x1, y1 + b * 0.35, x2, y2 + b * 0.6, rad))
+    ev[#ev + 1] = D.ev_rect(x1, y1, x2, y2, TOAST.fill, (NX.GL.SOLID - (NX.GL.SOLID - NX.GL.TINT) * thin) * a, TOAST.edge, 17 * a, fsp, rad)
+    -- full frame rate while it arrives, shakes, leaves or its bar is still easing; the breathing glow alone needs less
+    C.fast = (now - C.t0 < 0.3) or C.out ~= nil or (C.err_t ~= nil and now - C.err_t < 0.45) or (glass and thin < 1)
+        or (sp.frac ~= nil and math.abs(math.max(0, math.min(1, sp.frac)) - C.frac) > 0.001)
+    local function txt(x, y, an, fs, op, bold, s, rgb, extra)
+        ev[#ev + 1] = D.ev_text(x, y, an, string.format("\\fs%d\\b%d\\c%s\\1a%s%s", fs, bold and 1 or 0, U.ass_color(rgb or TOAST.text),
+            U.ass_alpha(op * a), extra or ""), U.ass_escape(s))
+    end
+    local tx, tr, tw = x1 + pad, x2 - pad, cw - 2 * pad
+    local y = y1 + pad
+    local right = sp.right or (sp.frac and not sp.err and string.format("%d %%", math.floor(C.frac * 100 + 0.5))) or nil
+    local rw = right and NX.sctw(right, fs3, true, nil, ww, wh) or 0
+    txt(tx, y + fs1 / 2, 4, fs1, 62, true, NX.scfit(sp.eyebrow or "", tw - rw - pad, fs1, true), nil, "\\fsp" .. fsp)
+    if right then txt(tr, y + fs1 / 2, 6, fs3, 90, true, right, sp.err and TOAST.bad or TOAST.text) end
+    y = y + fs1 + gap
+    txt(tx, y + fs2 / 2, 4, fs2, 100, true, NX.scfit(sp.title or "", tw, fs2, true))
+    y = y + fs2 + math.floor(gap * 0.7)
+    txt(tx, y + fs3 / 2, 4, fs3, sp.err and 95 or 72, false, NX.scfit(sp.line or "", tw, fs3, false),
+        sp.line_rgb or (sp.err and TOAST.bad) or nil)
+    y = y + fs3 + gap
+    -- the bar
+    local bx1, bx2, by1, by2 = tx, tr, y, y + bar_h
+    local r_ = bar_h / 2
+    ev[#ev + 1] = D.ev_rect(bx1, by1, bx2, by2, TOAST.text, 14 * a, nil, 0, 0, r_)
+    local col = sp.err and TOAST.bad or TOAST.accent
+    if sp.err then
+        ev[#ev + 1] = D.ev_rect(bx1, by1, bx1 + math.max(bar_h * 2, (bx2 - bx1) * math.max(C.frac, 0.02)), by2, col, 85 * a, nil, 0, 0, r_)
+    elseif sp.frac then
+        local fx = bx1 + math.max(bar_h * 2, (bx2 - bx1) * C.frac)
+        ev[#ev + 1] = D.ev_rect(bx1, by1, fx, by2, col, 100 * a, nil, 0, 0, r_)
+        if moving and C.frac < 0.999 then
+            -- the front edge breathes: a soft glow, about once a second
+            local p = 0.5 + 0.5 * math.sin(now * 2 * math.pi / 1.15)
+            local gr = bar_h * (1.6 + 0.9 * p)
+            ev[#ev + 1] = string.format("{\\an7\\pos(0,0)\\bord0\\shad0\\blur%s\\1c%s\\1a%s\\3a&HFF&\\p1}%s{\\p0}", D.fp(bar_h * 1.4),
+                U.ass_color(col), U.ass_alpha((35 + 45 * p) * a), D.rounded_path(fx - gr, (by1 + by2) / 2 - gr, fx + gr, (by1 + by2) / 2 + gr, gr, true))
+        end
+    elseif moving then
+        -- no number yet: a light band sweeps along the bar
+        local ph = (now * 0.75) % 1.5 - 0.3
+        local w_ = bx2 - bx1
+        local s1, s2 = math.max(bx1, bx1 + ph * w_), math.min(bx2, bx1 + (ph + 0.3) * w_)
+        if s2 > s1 then ev[#ev + 1] = D.ev_rect(s1, by1, s2, by2, col, 90 * a, nil, 0, 0, r_) end
+    end
+    y = by2
+    if sp.sub then
+        y = y + gap
+        txt(tx, y + fs4 / 2, 4, fs4, sp.sub_rgb and 92 or 55, false, NX.scfit(sp.sub, tw, fs4, false), sp.sub_rgb)
+        y = y + fs4
+    end
+    if sp.keys then
+        y = y + gap
+        -- "Esc   Back   T   Torrent": keys bright, what they do muted
+        local out, first = {}, true
+        for key, what in tostring(sp.keys):gmatch("([^:]+):([^|]+)|?") do
+            out[#out + 1] = string.format("{\\b1\\1a%s}%s {\\b0\\1a%s}%s", U.ass_alpha(92 * a), U.ass_escape((first and "" or "     ") .. key),
+                U.ass_alpha(55 * a), U.ass_escape(what))
+            first = false
+        end
+        ev[#ev + 1] = D.ev_text(tx, y + fs4 / 2, 4, string.format("\\fs%d\\c%s", fs4, U.ass_color(TOAST.text)), table.concat(out))
+    end
+    C.ov = C.ov or mp.create_osd_overlay("ass-events")
+    C.ov.res_x, C.ov.res_y, C.ov.z = ww, wh, 3005          -- above the browser (3000) and its animation layer
+    C.ov.data = table.concat(ev, "\n")
+    C.ov:update()
+    if not moving and C.timer then C.timer:kill(); C.timer = nil end
+end
+mp.observe_property("osd-dimensions", "native", function() if NX.SC.spec then NX.SC.draw() end end)
+MS.sc = NX.SC
+
+NX.TS = { ov = nil, timer = nil, spec = nil, t0 = 0, secs = 3 }
+function NX.TS.draw()
+    local T = NX.TS
+    local sp = T.spec
+    local ww, wh = U.canvas_size()
+    if not sp or not ww or ww <= 0 then return end
+    local age = mp.get_time() - T.t0
+    local left = T.secs - age
+    if left <= 0 then return T.hide() end
+    local a = math.min(1, age / 0.18, left / 0.3)
+    local ease = 1 - (1 - math.min(1, age / 0.25)) ^ 3
+    local S = wh / 1080
+    local fs1, fs2 = math.max(11, math.floor(12 * S)), math.max(14, math.floor(17 * S))
+    local pad, gap = math.floor(18 * S), math.floor(12 * S)
+    local fsp = math.max(1, math.floor(S + 0.5))
+    local w1 = sp.eyebrow and D.mw(sp.eyebrow, fs1, true, fsp, ww, wh) or 0
+    local w2 = sp.title and D.mw(sp.title, fs2, true, nil, ww, wh) or 0
+    local w3 = sp.extra and D.mw(sp.extra, fs2, false, nil, ww, wh) or 0
+    -- a long title (a file name) is shortened so the pill stays within the window
+    local title = sp.title
+    local room = ww * 0.72 - pad * 2 - w1 - w3 - gap * 3
+    if title and w2 > room and room > 60 * S then title = U.fit_text(title, room, fs2); w2 = D.mw(title, fs2, true, nil, ww, wh) end
+    local cw, n = pad * 2, 0
+    for _, v in ipairs({ w1, w2, w3 }) do if v > 0 then cw = cw + v; n = n + 1 end end
+    cw = math.min(ww - 40 * S, cw + gap * math.max(0, n - 1))
+    local ch = math.floor(44 * S)
+    local x1, y1, pos = NX.corner(sp.pos, cw, ch, S, "top-right")
+    local np = not browser_active and sp.beside == "np" and NX.NP.shown and NX.NP.rect
+    if np then
+        local gx = math.floor(12 * S)
+        if np[3] + gx + cw <= ww - 20 * S then x1, y1 = np[3] + gx, math.floor((np[2] + np[4]) / 2 - ch / 2)
+        else x1, y1 = np[1], np[2] - ch - gx end
+        T.at = { x1, y1 }
+    elseif sp.beside and T.at and not browser_active then x1, y1 = T.at[1], T.at[2] end
+    local side = sp.beside and T.at ~= nil and not browser_active
+    local rx, ry = math.floor(x1 + 0.5), math.floor(y1 + 0.5)        -- where it rests (the glass stays there)
+    local settled = age >= (side and 0.32 or 0.25)
+    if side then
+        local k = math.min(1, age / 0.32)
+        local back = 1 + 2.2 * (k - 1) ^ 3 + 1.2 * (k - 1) ^ 2
+        x1 = math.floor(x1 - (1 - back) * 26 * S - (1 - math.min(1, left / 0.3)) * 14 * S + 0.5)
+    else
+        y1 = y1 + math.floor((pos:find("^top") and -1 or 1) * (1 - ease) * 10 * S)
+    end
+    if sp.kind == "err" and age < 0.6 then
+        local k = math.max(0, age - 0.15) / 0.45
+        if k > 0 and k < 1 then x1 = math.floor(x1 + math.sin(k * math.pi * 5) * 7 * S * (1 - k) + 0.5) end
+    end
+    if T.swap_t then a = a * (0.45 + 0.55 * math.min(1, (mp.get_time() - T.swap_t) / 0.2)) end
+    local x2, y2 = x1 + cw, y1 + ch
+    local rad = math.floor(ch / 2)
+    -- the blurred video behind it comes on once the pill has arrived (moving it with the pill would reset mpv's
+    -- renderer every frame); the pill's tint thins out over it so it does not pop
+    local glass = settled and (not browser_active) and NX.GL.show("ts", rx, ry, rx + cw, ry + ch, rad, S)
+    if glass and not T.glass_t then T.glass_t = mp.get_time() end
+    if not glass then T.glass_t = nil end
+    local thin = glass and math.min(1, (mp.get_time() - T.glass_t) / 0.2) or 0
+    local ev = {}
+    local b = math.max(6, math.floor(14 * S))
+    ev[#ev + 1] = string.format("{\\an7\\pos(0,0)\\bord0\\shad0\\blur%d\\1c&H000000&\\1a%s\\3a&HFF&\\p1}%s{\\p0}",
+        b, U.ass_alpha(22 * a), D.rounded_path(x1, y1 + b * 0.35, x2, y2 + b * 0.6, rad))
+    ev[#ev + 1] = D.ev_rect(x1, y1, x2, y2, TOAST.fill, (NX.GL.SOLID - (NX.GL.SOLID - NX.GL.TINT) * thin) * a, TOAST.edge, 17 * a, fsp, rad)
+    local cy = (y1 + y2) / 2
+    local x = x1 + pad
+    local function txt(fs, op, bold, str, extra)
+        ev[#ev + 1] = D.ev_text(x, cy, 4, string.format("\\fs%d\\b%d\\c%s\\1a%s%s", fs, bold and 1 or 0, U.ass_color(TOAST.text), U.ass_alpha(op * a), extra or ""), U.ass_escape(str))
+    end
+    if sp.eyebrow then txt(fs1, 62, true, sp.eyebrow, "\\fsp" .. fsp); x = x + w1 + gap end
+    if title then txt(fs2, 100, true, title); x = x + w2 + gap end
+    if sp.extra then txt(fs2, 60, false, sp.extra) end
+    T.ov = T.ov or mp.create_osd_overlay("ass-events")
+    T.ov.res_x, T.ov.res_y, T.ov.z = ww, wh, browser_active and 3004 or 2000     -- above the browser (3000) while it is open
+    local data = table.concat(ev, "\n")
+    local key = data .. "|" .. ww .. "x" .. wh .. "|" .. T.ov.z
+    if key ~= T.last then T.ov.data = data; T.ov:update(); T.last = key end
+    -- frames only while something moves (arriving, a shake, new words, the tint thinning, leaving); a pill at rest is
+    -- drawn once and woken again when it starts to leave
+    local now = mp.get_time()
+    local busy = age < 0.62 or left < 0.32 or (T.swap_t and now - T.swap_t < 0.22) or (glass and thin < 1)
+    T.run(busy, 60, left - 0.3)
+end
+function NX.TS.run(on, fps, wake)
+    local T = NX.TS
+    if T.wake then T.wake:kill(); T.wake = nil end
+    if on then
+        if T.timer and T.fps ~= fps then T.timer:kill(); T.timer = nil end
+        if not T.timer then T.timer, T.fps = mp.add_periodic_timer(1 / fps, T.draw), fps end
+    else
+        if T.timer then T.timer:kill(); T.timer = nil end
+        T.wake = mp.add_timeout(math.max(0.02, wake or 0.5), T.draw)
+    end
+end
+-- the browser opened (true) or closed: a toast on screen is drawn again at once (NX is declared after the browser code)
+MS.ts_follow = function(opened)
+    if not NX.TS.spec then return end
+    if opened then NX.GL.hide("ts") end
+    NX.TS.draw()
+end
+function NX.TS.hide()
+    local T = NX.TS
+    if T.timer then T.timer:kill(); T.timer = nil end
+    if T.wake then T.wake:kill(); T.wake = nil end
+    T.spec, T.last, T.glass_t = nil, nil, nil
+    if T.ov then T.ov.data = ""; T.ov:update() end
+    NX.GL.hide("ts")
+end
+MS.toast = function(spec, secs) return NX.TS.show(spec, secs) end      -- for code above NX (the config reload)
+function NX.TS.show(spec, secs)
+    local T = NX.TS
+    local now = mp.get_time()
+    if T.spec and spec.key and T.spec.key == spec.key and now - T.t0 < T.secs - 0.3 then
+        if T.spec.title ~= spec.title or T.spec.eyebrow ~= spec.eyebrow then T.swap_t = now end
+        if T.spec.beside and spec.beside == nil then spec.beside = T.spec.beside end
+        T.spec, T.secs = spec, (now - T.t0) + (secs or 3)
+    else
+        T.spec, T.t0, T.secs, T.at, T.swap_t = spec, now, secs or 3, nil, nil
+    end
+    T.draw()
+end
+mp.observe_property("osd-dimensions", "native", function() if NX.TS.spec then NX.TS.draw() end end)
+-- messages while playing: a glass pill (playback_toasts), or mpv's plain text
+MS.say = function(spec, secs)
+    if o.playback_toasts == false then
+        local t = {}
+        for _, k in ipairs({ "eyebrow", "title", "extra" }) do if spec[k] and spec[k] ~= "" then t[#t + 1] = spec[k] end end
+        mp.osd_message(table.concat(t, "  ·  "), secs or 3)
+        return
+    end
+    NX.TS.show(spec, secs)
+end
+-- beside the Now playing card: waits a moment for the card, then a beat more
+mp.wb_on_bug = function(err)
+    local short = tostring(err):gsub("^.-:%d+: ", ""):sub(1, 90)
+    NX.TS.show({ eyebrow = "WEBDAV-BROWSER", title = "Hit a bug and carried on", extra = short, kind = "err" }, 6)
+end
+MS.say_np = function(spec, secs, on_shown)
+    local t0 = mp.get_time()
+    MS.np_gen = (MS.np_gen or 0) + 1
+    local gen = MS.np_gen
+    local function show()
+        if MS.np_gen ~= gen then return end
+        MS.say(spec, secs)
+        if on_shown then on_shown(secs) end
+    end
+    local function try()
+        if MS.np_gen ~= gen then return end
+        if NX.NP.shown and NX.NP.rect then
+            spec.beside = "np"
+            mp.add_timeout(0.15, show)
+        elseif mp.get_time() - t0 > 2.5 or not o.now_playing_card or o.playback_toasts == false then show()
+        else mp.add_timeout(0.1, try) end
+    end
+    try()
+end
+if o.startup_toast then
+    mp.add_timeout(0.8, function()
+        -- with the poster edition loaded too, its toast speaks for both
+        local ok, list = pcall(mp.get_property_native, "input-bindings")
+        for _, b in ipairs(ok and type(list) == "table" and list or {}) do
+            if tostring(b.cmd or ""):find("script-binding webdav_browser_posters/", 1, true) then return end
+        end
+        local key = (tostring(o.open_key or "ctrl+w"):match("[^%s,]+") or "ctrl+w"):gsub("(%a)(%w*)", function(c, r) return c:upper() .. r:lower() end)
+        local spec = { eyebrow = "WEBDAV LIBRARY", title = "Ready", extra = "Press " .. key .. " to browse", pos = o.startup_toast_position }
+        if o.url == "" then spec.title, spec.extra = "Almost there", "add url, user and pass to webdav-browser.conf" end
+        NX.TS.show(spec, (o.url == "") and 5 or 3)
+    end)
+end
