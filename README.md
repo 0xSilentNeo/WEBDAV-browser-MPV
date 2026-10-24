@@ -13,7 +13,7 @@ Built for Real-Debrid, works with any WebDAV server.
 ![lua](https://img.shields.io/badge/Lua-script-2c2d72?style=flat-square&logo=lua&logoColor=white)
 ![tmdb](https://img.shields.io/badge/artwork-TMDB-01b4e4?style=flat-square&logo=themoviedatabase&logoColor=white)
 
-[Install](#install) · [Features](#features) · [Keys](#keys) · [Settings](#settings) · [Changelog](CHANGELOG.md)
+[Install](##install) · [Features](##features) · [Keys](##keys) · [Settings](##settings) · [Changelog](CHANGELOG.md)
 
 </div>
 
