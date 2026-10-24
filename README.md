@@ -30,10 +30,10 @@ Pick one, or install both side by side. They share one config file and one watch
 | 🎬 | `webdav-browser-posters.lua` | Netflix-style posters, title pages, episode stills | `Ctrl+P` |
 | 📁 | `webdav-browser.lua` | A fast two-panel list: Folders │ Files | `Ctrl+W` |
 
-<img width="85%" alt="The poster edition" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
+<img width="85%" alt="The poster edition" src="https://github.com/user-attachments/assets/77782667-bc86-4d19-8f71-69b0c391e5ac" />
 <br/><sub><b>Poster edition</b></sub>
 <br/><br/>
-<img width="85%" alt="The list edition" src="https://github.com/user-attachments/assets/fede1596-b8ff-4095-a579-49964efa24d1" />
+<img width="85%" alt="The list edition" src="https://github.com/user-attachments/assets/647b462b-9ab6-4de1-822d-47a4ff0d79ef" />
 <br/><sub><b>List edition</b></sub>
 
 </div>
