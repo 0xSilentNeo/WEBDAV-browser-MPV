@@ -2,192 +2,232 @@
 
 # webdav-browser
 
-Browse and play a WebDAV video library (built for Real-Debrid, works with any WebDAV server) inside [MPV](https://mpv.io).
+**Your Real-Debrid library, inside mpv.**<br/>
+Browse, search and play a WebDAV video library without leaving the player.<br/>
+Built for Real-Debrid, works with any WebDAV server.
 
-</div>
+<br/>
 
-<p align="center">The script has two UIs to choose from:</p>
+![version](https://img.shields.io/badge/version-26.11-1f6feb?style=flat-square)
+![mpv](https://img.shields.io/badge/mpv-0.37%2B-6e40c9?style=flat-square)
+![lua](https://img.shields.io/badge/Lua-script-2c2d72?style=flat-square&logo=lua&logoColor=white)
+![tmdb](https://img.shields.io/badge/artwork-TMDB-01b4e4?style=flat-square&logo=themoviedatabase&logoColor=white)
 
-<div align="center">
-
-| Script | Look | Opens with |
-|---|---|---|
-| `webdav-browser-posters.lua` | Netflix-style posters, title pages, episode stills | `Ctrl+P` |
-
-<a href="url"><img src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" height="auto" width="85%" style="border-radius:50%"></a>
-
-<img width="85%" alt="webdav-browser-posters" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
-
-<br/><br/>
-
-| Script | Look | Opens with |
-|---|---|---|
-| `webdav-browser.lua` | Fast two-panel list (Folders \| Files) | `Ctrl+W` |
-
-<img width="85%" alt="webdav-browser" src="https://github.com/user-attachments/assets/fede1596-b8ff-4095-a579-49964efa24d1" />
+[Install](#install) · [Features](#features) · [Keys](#keys) · [Settings](#settings) · [Changelog](CHANGELOG.md)
 
 </div>
 
 <br/>
 
-Both share one config file and one watch history, and can be installed side by side.
+## Two editions
+
+Pick one, or install both side by side. They share one config file and one watch history.
+
+<div align="center">
+
+| | Edition | Look | Opens with |
+|:-:|---|---|:-:|
+| 🎬 | `webdav-browser-posters.lua` | Netflix-style posters, title pages, episode stills | `Ctrl+P` |
+| 📁 | `webdav-browser.lua` | A fast two-panel list: Folders │ Files | `Ctrl+W` |
+
+<img width="85%" alt="The poster edition" src="https://github.com/user-attachments/assets/7c1c5cee-3bd2-48e4-b5d4-f46a209ba23e" />
+<br/><sub><b>Poster edition</b></sub>
+<br/><br/>
+<img width="85%" alt="The list edition" src="https://github.com/user-attachments/assets/fede1596-b8ff-4095-a579-49964efa24d1" />
+<br/><sub><b>List edition</b></sub>
+
+</div>
+
+<br/>
 
 ## Install
 
-1. Put the `.lua` file(s) in `<mpv config>/scripts/` (Windows: `%APPDATA%\mpv\scripts\`).
-
-2. Put `webdav-browser.conf` in `<mpv config>/script-opts/` and add your login:
+1. Copy the `.lua` file(s) into `<mpv config>/scripts/` (on Windows, `%APPDATA%\mpv\scripts\`).
+2. Copy `webdav-browser.conf` into `<mpv config>/script-opts/` and fill in your login:
    ```ini
-   user=YOUR_USERNAME
+   user=YOUR_REAL_DEBRID_USERNAME
    pass=YOUR_WEBDAV_PASSWORD
    ```
-3. Poster edition: add a free TMDB key (`tmdb_key=`, from themoviedb.org → Settings → API).
+3. **Poster edition:** add a free TMDB key as `tmdb_key=` (themoviedb.org → Settings → API).
+4. Press `F1`. The **setup check** tests every service and folder for real and tells you what to change if
+   something fails.
 
-4. Optional (poster edition):
-   - `rd_api_token=` ([real-debrid.com/apitoken](https://real-debrid.com/apitoken)) – adding releases, missing-episode reasons.
-   - `addon_urls=` – your Stremio add-on manifest URLs (AIOStreams, Comet, Torrentio…) for the add screen.
-   - [rqbit](https://github.com/ikatson/rqbit/releases) – rename the Windows build to `rqbit.exe` and put it next to
-     `mpv.exe`; streams torrents that Real-Debrid refuses.
+**Needs** `curl` (built into Windows 10 and later). **Recommended:** ffmpeg for much faster artwork, and
+`vo=gpu-next` in `mpv.conf` for the frosted-glass blur behind the cards.
 
-Needs `curl` (built into Windows 10+). Installing **ffmpeg** makes artwork conversion much faster.
-`vo=gpu-next` in `mpv.conf` enables the frosted-glass blur on the on-screen cards.
+<details>
+<summary><b>Optional extras for the poster edition</b></summary>
+<br/>
 
-Press `F1` at any time for a **setup check**: every service and folder is tested and failures say what to change.
+| Add | What it unlocks |
+|---|---|
+| `rd_api_token=` ([real-debrid.com/apitoken](https://real-debrid.com/apitoken)) | Adding releases, and the reason a missing episode is missing |
+| `addon_urls=` | Your Stremio add-on manifests (AIOStreams, Comet, Torrentio…) for the add screen |
+| [rqbit](https://github.com/ikatson/rqbit/releases) | Streams the torrents Real-Debrid refuses. Rename the Windows build to `rqbit.exe` and put it next to `mpv.exe` |
+
+</details>
+
+> [!NOTE]
+> Your login reaches curl through a small file next to the data file (`webdav_browser_curl.cfg`), so it never shows up
+> in mpv's log. mpv's own *verbose* log still records the playback login header, so trim it before sharing a full log.
+> The `F1` report never contains it.
+
+<br/>
 
 ## Features
 
-### Browsing
-- Clean titles: `S01E03` plus quality chips (4K, HDR, DV, Atmos, Remux).
-- Continue Watching, watched ticks, resume with a start-over key.
-- Listings are cached and refreshed quietly; folders Real-Debrid is still filling are re-checked until complete.
-
-### Search
-- Typo-tolerant title search with a real text cursor.
-- Filters: `genre:anime  year:2010s  type:tv  rating:8  unwatched` (also as clickable chips).
-- Optional file-name index of your library.
+### Everywhere
+- **Clean titles** with `S01E03` and quality chips: 4K, HDR, DV, Atmos, Remux.
+- **Continue Watching**, watched ticks, and resume with a start-over key.
+- **Typo-tolerant search** with filters: `genre:anime  year:2010s  type:tv  rating:8  unwatched`, plus an optional
+  index of every file name in your library.
+- **Listings are cached** and refreshed quietly; folders Real-Debrid is still filling are re-checked until complete.
+- **One click opens** a title or plays a file (`single_click_open`).
 
 ### Playback
-- Following episodes play as a playlist; the next one is buffered ahead.
-- **Up next** glass card with the episode still and a countdown ring, timed to the end credits or to where a chapter-skip script jumps.
-- **Now playing** card for a few seconds when a file starts: title, episode, resolution and source.
-- Both cards and the startup note can be turned off and placed in any corner.
-- **Skip intro / skip credits:** a small "Skip intro · S" note while a named opening chapter plays (unless a
-  chapter-skip script is loaded), and S on the Up next card skips the credits (to the preview when there is one).
-- Audio and subtitle language remembered per show (`remember_tracks`); the title page says what will be picked.
-- Download-while-playing fallback when a stream fails, shown on a floating glass card with a live progress bar.
-- **Downloaded files play from your computer** (`play_local_first`): once an episode is in `download_dir`, its
-  card says "⤓ on your PC" and Play uses the local copy — the start of offline viewing.
-- While the browser is open over a video, the player's controller and its seekbar thumbnails stay hidden (`hide_osc`).
+- Following episodes play as a playlist, with the next one buffered ahead.
+- **Up next** glass card with the episode still and a countdown ring, timed to the end credits (or to wherever your
+  chapter-skip script jumps).
+- **Now playing** card when a file starts. Resuming slides out "Resumed at 12:34 · B start over" beside it.
+- Messages while playing (Retrying, Couldn't play, Buffering, Starting…) are glass pills too (`playback_toasts`).
+- **Skip intro · S** while a named opening plays; S on the Up next card skips the credits.
+- Audio and subtitle languages remembered per show (`remember_tracks`).
+- If a stream fails, the file downloads while you watch, with a progress card. Files you've downloaded play from your
+  computer (`play_local_first`).
+- Every card can be switched off and placed in any corner. The player's own controller stays hidden while the browser
+  is open over a video (`hide_osc`).
 
 ### Poster edition
-- **Home:** Continue Watching (episode stills) and All Titles, sortable. One clean title per card with
-  `★ 8.1 · 2024 · Series` under it (Series, Movie or Anime; seasons and quality when there is room).
-  **Filter chips** (TV, Movies, Unwatched, ★ 8+, your library's genres and decades) filter All Titles and are
-  remembered between sessions (`home_filter_chips`).
-- **Title pages:** rating, years, runtime and outlined chips (4K, HDR, age rating), genres, "You have 61 of 366
-  episodes", the synopsis with More / Less, and buttons: **Play / Resume S01E05**, **Queue**, **Mark watched**,
-  **Find more** and **Download** (↑ from the cards reaches them). One card per episode with its TMDB still and
-  synopsis; season grid for long shows.
-- **Downloads:** the Download button opens a small popover above it: tick the files (Space, A for all), Enter
-  starts and it gets out of the way. The **↓ Downloads** pill in the footer says "Download started" / "Queued · #3"
-  with a short animation, shows the current file's progress and a count badge, and opens the queue window (also
-  `Shift+D`): every file of every title, pause / resume, Stop, remove (Del), reorder (Shift+↑↓), retry what failed.
-  Files go to `download_dir/<Title>/`; half-finished ones are continued.
-- **Tracked shows:** **+ Track** on a title page (library or add screen) keeps it in the **Tracked** flyout on the top
-  bar (`U`): poster, next episode with its date and countdown (anime: AniList's exact airing time), "Date TBA", or
-  the release date for movies. While mpv runs it checks every few hours and tells you in one toast when something
-  new is out — and whether your add-ons already have a cached release of it (`track_cached_check`); each title's bell
-  sets every episode / new seasons only / off. A **calendar view** (`track_view=calendar`, or the ▦ pill) shows the
-  week on top and groups the titles by day; a tracked show's library page says when its next episode is due.
-- **Unavailable files:** when Real-Debrid removed a title's files, a card says why and offers Retry, Find another
-  release, Stream as a torrent (`T`, unless nobody seeds it) and the setup check.
-- **Anime matching:** romaji names resolved through AniList and the anime-lists id map, including "Part 2" and odd season numbers.
-- **Missing episodes:** greyed cards, with the reason from Real-Debrid if you add an API token.
-- **Responsive layout:** sizes snap to steps of the window height, so resize, maximise and full screen reflow instantly without re-converting artwork; blurred placeholders while images load. Card sizes are adjustable (`home_card_pct`, `landscape_card_pct`, `episode_card_pct`).
-- **Transitions:** opening a title flies its poster out of the card into place, the backdrop settles in and the lines
-  and rows follow one after another; Back flies the poster home. Play fades to black with a "Starting…" note until the
-  video is up (mpv 0.38+, `transitions`, `transition_style`).
-- **Focus:** the selected card grows and the others dim around it (`focus_style=dim`, mpv 0.38+; the accent outline is
-  optional, `focus_ring`); a row cut off at the bottom fades out instead of ending in a hard line.
-- **Smooth scrolling:** the rows glide, like a website (`smooth_scroll`).
-- **Themes:** `theme=classic | graphite | netflix | rose | ios`, every colour overridable; the glass toasts and cards
-  have their own `toast_theme`.
-- **Polish:** rounded corners, shadows, a growing selected card, a season heading that stays pinned while you scroll, artwork prepared ahead of scrolling, sharp images on 4K, animations at your display's refresh rate (up to 90 fps).
-- **Offline-friendly cache:** TMDB matches, episode data and downloaded artwork are kept for good; a different card size or window reuses them instead of downloading again. Pictures cut off by a dropped connection are found and fetched again.
-- **Search by any name:** original and other titles and the film series are searched too (`search_cast`,
-  `search_keywords` for more).
-- **Couch mode:** gamepad / TV-remote control with a large focus ring.
-- **`?`** on any page: a sheet with the keys of that page.
-- **Setup check (`F1`):** every service and folder tested for real, one row per add-on with a stream question and its
-  answer time; `C` copies the report to the clipboard (and saves it in the cache folder).
-- **Glass bars (experimental):** `experimental_glass_bars=yes` turns the top and bottom bars into thin floating pills: Home, clickable breadcrumbs, a status pill that opens the setup check (its dot breathes, `pulse`), and the keys and cache at the bottom - also on the add screen, with the title details in a floating card. The classic top bar's height is set with `top_bar_scale`.
-- **Experimental visuals (26.4, off by default):** the paused video visible and blurred behind the browser
-  (`experimental_video_glass`), a colour wash in the poster's colour behind the title page's text
-  (`experimental_hero_wash`), TMDB's title logo instead of the title text (`experimental_title_logo`), NEW on this
-  week's episodes and the next episode on tracked shows' cards (`experimental_new_badges`), cards that grow under the
-  mouse (`experimental_hover_lift`), pop-ups that fade out (`experimental_exit_anim`) and drawn empty states
-  (`experimental_empty_states`).
+| | |
+|---|---|
+| **Home** | Continue Watching (episode stills) and All Titles, sortable, with `★ 8.1 · 2024 · Series` under each card. Search right on the page, and filter chips for TV, Movies, Unwatched, ★ 8+, genres and decades. |
+| **Title pages** | Rating, runtime, 4K/HDR/age chips, genres, "You have 61 of 366 episodes", the synopsis, and Play / Resume, Queue, Mark watched, Find more and Download. One card per episode with its TMDB still. |
+| **Add from add-ons** (`N`) | Trending, streaming-service, airing-anime and new-season rows. Search any title, see every release from your add-ons with quality, codec, audio, languages and size, tick the files and add. Nyaa.si as a second source, and rqbit for torrents Real-Debrid refuses. |
+| **Tracked shows** (`U`) | "+ Track" any show. Next episode, date and countdown in your time zone, a calendar view, a toast when something new is out, and a sound when it's actually cached and streamable. |
+| **Downloads** | Tick files in a small popover and press **↓ Download**. A footer pill shows progress; the queue window (`Shift+D`) pauses, reorders, retries and removes. |
+| **Smart matching** | Anime resolved through AniList, box sets get their TMDB collection, and missing episodes show greyed out with Real-Debrid's reason. |
+| **Motion** | Posters fly into the title page and back, the rows glide, the selected card grows while the rest dims, and posters blur while moving so a 4K screen stays smooth. |
+| **Looks** | Five themes (`classic` `graphite` `netflix` `rose` `ios`), title logos, a colour wash from the poster, rounded glass cards, sharp pictures on 4K, never stretched. |
+| **Your way** | Mouse, keys or a gamepad (couch mode). `?` shows the keys of every page. |
 
-### Add from add-ons (poster edition, `N`)
-- Home page with trending (TOP 10 badges), streaming-service, airing-anime and new-season rows (TMDB + AniList);
-  arrows over the row's edge page through it.
-- A title page for every title, laid out like the library's (poster, the details centred beside it, the backdrop
-  faded in on the right): **Search movie / show / anime on AIOStreams**, **Search Nyaa.si** (anime) and **+ Track**,
-  with the next episode or release date, and a row of its seasons (straight to that season's releases) or
-  "More like this".
-- Search any title and list its releases from your Stremio add-ons; every season pack and complete-series pack, sortable and filterable (`dual 1080 -hevc`).
+<details>
+<summary><b>More about the add screen</b></summary>
+<br/>
+
+- Every title gets a page laid out like the library's: **Search movie / show / anime on AIOStreams**, **Search
+  Nyaa.si** (anime) and **+ Track**, with the next episode or release date and a row of its seasons or "More like
+  this".
+- Every season pack and complete-series pack is listed, sortable and filterable (`dual 1080 -hevc`).
 - Each release shows folder and file name, cached or not, quality, codec, audio, languages, group and both sizes.
-- File checklist before anything is added; releases already on your Real-Debrid are reused, never added twice.
-- **Nyaa.si** as a second source (`Tab`). When the add-ons find only a few releases, a button offers Nyaa.si for the
-  same title (`nyaa_fallback=ask`; `auto` sends anime there by itself).
-- **Torrent streaming:** releases Real-Debrid refuses ("infringing file") are streamed through rqbit automatically,
-  with a compact progress card until enough is buffered (`torrent_fallback=manual` asks first); a torrent nobody
-  seeds says so.
+- You tick the files before anything is added, and releases already on your Real-Debrid are reused, never added
+  twice.
+- When the add-ons find only a few releases, a button offers Nyaa.si for the same title (`nyaa_fallback=ask`, or
+  `auto` for anime).
+- Releases Real-Debrid calls "infringing" stream through rqbit with a small progress card (`torrent_fallback`); a
+  torrent nobody seeds says so.
+
+</details>
+
+<details>
+<summary><b>More about tracked shows</b></summary>
+<br/>
+
+- The flyout shows the poster, next episode with date and countdown, "Date TBA", or a film's release date.
+- Air times come from TVmaze (no key needed) and AniList for anime, shown in your own time zone (`track_air_times`,
+  `clock_24h`).
+- Checks run shortly after mpv starts and every few hours after; what's new arrives in one toast, with whether your
+  add-ons already have it cached (`track_cached_check`).
+- Once an episode airs, your add-ons are asked every 15 minutes until a cached release appears, then a toast and a
+  sound tell you, even mid-video (`track_watch_release`, `track_poll_mins`, `track_sound`).
+- Each show has a bell: every episode, new seasons only, or off. The pill's bell rings until you've looked
+  (`track_bell_anim`).
+
+</details>
+
+<details>
+<summary><b>Experimental, off unless you switch it on</b></summary>
+<br/>
+
+Each has its own setting. All of them are switched on in the conf that ships with the script, so you can try them.
+
+| Setting | What it does |
+|---|---|
+| `experimental_mouse_ui` | Hover buttons on cards, clickable key hints, a right-click menu, a draggable scroll bar, full titles on hover, click-outside-to-close, sideways swipe |
+| `experimental_row_drag` | Drag rows sideways; flick them, and they spring back at the ends |
+| `experimental_glass_bars` | Top and bottom bars become thin floating pills |
+| `experimental_video_glass` | The paused video shows, blurred, behind the browser |
+| `experimental_rubberband` | A springy bounce at the end of a row or the page |
+| `experimental_parallax` | Continue Watching pictures and episode stills float against the pointer |
+| `experimental_caret` | A blinking cursor, and letters that fade in as you type *(both editions)* |
+| `experimental_exit_to_video` | The page fades into the video as the browser closes *(both editions)* |
+| `experimental_play_tilt` | The Play button tilts towards the pointer |
+| `experimental_search_collapse` | The search pill rests as just its magnifier |
+| `experimental_live_search` | Results follow every key you type |
+| `experimental_chip_stagger` | Filter chips pop in one after another |
+| `experimental_decode` | Titles and notices decode themselves in |
+
+</details>
+
+<br/>
 
 ## Keys
 
-| | Keyboard | Gamepad |
-|---|---|---|
-| Move | Arrows, PgUp / PgDn | D-pad, LB / RB |
-| Open / play | `Enter` | A |
-| Back / close | `Esc`, Backspace, mouse-back | B |
+| | Keyboard / mouse | Gamepad |
+|---|---|:-:|
+| Open / close | `Ctrl+P` (posters) · `Ctrl+W` (list) | View |
+| Move | Arrows, `PgUp` / `PgDn`, the wheel | D-pad, LB / RB |
+| Open / play | `Enter`, or a click | A |
+| Back / close | `Esc`, `Backspace`, mouse back | B |
 | Watched / queue | `M` / `A` | X / Y |
 | Sort | `S` | Start |
-| Search | `F` (edit with ← → Home End Del, ↓ to results) | – |
-| Add from add-ons | `N` (there: `T` streams a release as a torrent) | – |
-| Refresh / re-fetch art | `R` / `T` (on a title Real-Debrid removed: stream it as a torrent) | – |
-| Whole synopsis | `I` (title page) | – |
-| Download queue | `Shift+D` (anywhere in the library) | – |
+| Search | `F` | – |
+| Add from add-ons | `N` | – |
+| Refresh / re-fetch art | `R` / `T` | – |
+| Whole synopsis | `I` | – |
+| Downloads | `Shift+D` | – |
 | Tracked shows | `U` | – |
 | Keys of this page | `?` | – |
-| Setup check | `F1` (anywhere) | – |
-| Open / close | `Ctrl+P` / `Ctrl+W` | View |
+| Setup check | `F1` | – |
+| Title menu | Right-click a card | – |
 
-Every key can be changed in `webdav-browser.conf` (`key_up`, `key_open`, `key_back`, …). Browser keys only exist
-while the browser is open.
+Every key can be changed in the conf (`key_up`, `key_open`, `key_back`…). The browser's keys only exist while it's
+open.
 
-## Configuration
+<br/>
 
-Every option is explained in `webdav-browser.conf`. The ones most people change: `start_path`, `ui_scale`,
-`home_card_pct`, `merge_seasons`, `poster_overrides`, `rd_api_token`, `addon_urls`, `next_episode_card`,
-`next_card_position`, `now_playing_position`, `torrent_fallback`, `transitions`, `couch_mode`, `theme`,
-`toast_theme`, `focus_style`, `download_dir`, `play_local_first`, `track_shows`. Settings added in a version are listed
-at the end of the file under "New in …"; a misspelt value falls back to the default with a line in mpv's log. The
-file is grouped by topic (connection, services, library, playback, cards, look, poster screens, artwork, add-ons,
-torrents, keys). See `CHANGELOG` for what each version brought.
+## Settings
+
+Everything is explained in `webdav-browser.conf`, grouped by topic: connection, services, library, playback, cards,
+look, poster screens, artwork, add-ons, torrents and keys. Settings added in each version sit at the end of the file
+under "New in …", and a misspelt value falls back to its default with a line in mpv's log.
+
+The ones people change most: `start_path` · `ui_scale` · `home_card_pct` · `merge_seasons` · `poster_overrides` ·
+`theme` · `toast_theme` · `focus_style` · `transitions` · `next_card_position` · `now_playing_position` ·
+`download_dir` · `play_local_first` · `track_shows` · `single_click_open` · `couch_mode`
+
+<br/>
 
 
-## Recommended/Used companion scripts
+## Goes well with
 
-- [ModernZ](https://github.com/Samillion/ModernZ) – A sleek and modern OSC for mpv.
-- [thumbfast](https://github.com/po5/thumbfast) – seek-bar thumbnails for uosc and other OSCs. Set `network=yes` in `thumbfast.conf` for streams.
-- [op-ed-pv-skip](https://github.com/awaken1ng/mpv-op-ed-pv-skip) or another chapter skipper – skips openings / endings; the next-episode card adapts to it.
-- [autosubsync-mpv](https://github.com/joaquintorres/autosubsync-mpv) – fixes out-of-sync subtitles with one key.
-- [Anime4K](https://github.com/bloc97/Anime4K) – GPU shaders that upscale anime sharply on a 4K screen.
-- [hold-speed](https://github.com/0xSilentNeo/Hold-Speed) – A Lua script for mpv that mimics YouTube's playback speed feature.
+- [ModernZ](https://github.com/Samillion/ModernZ): a sleek, modern OSC for mpv
+- [thumbfast](https://github.com/po5/thumbfast): seekbar thumbnails (set `network=yes` in `thumbfast.conf` for streams)
+- [op-ed-pv-skip](https://github.com/awaken1ng/mpv-op-ed-pv-skip): skips openings and endings; the Up next card adapts
+  to it
+- [autosubsync-mpv](https://github.com/joaquintorres/autosubsync-mpv): fixes out-of-sync subtitles with one key
+- [Anime4K](https://github.com/bloc97/Anime4K): sharp anime upscaling on a 4K screen
+- [hold-speed](https://github.com/0xSilentNeo/Hold-Speed): YouTube-style hold-to-speed-up
 
-## Credits
+<br/>
 
-Metadata and artwork from [TMDB](https://www.themoviedb.org) – this product uses the TMDB API but is not endorsed or
-certified by TMDB. Anime matching via [AniList](https://anilist.co) and [Fribb/anime-lists](https://github.com/Fribb/anime-lists).
-Torrent streaming via [rqbit](https://github.com/ikatson/rqbit).
+---
+
+<div align="center">
+<sub>
+Metadata and artwork from <a href="https://www.themoviedb.org">TMDB</a>. This product uses the TMDB API but is not
+endorsed or certified by TMDB.<br/>
+Anime matching via <a href="https://anilist.co">AniList</a> and
+<a href="https://github.com/Fribb/anime-lists">Fribb/anime-lists</a> · Torrent streaming via
+<a href="https://github.com/ikatson/rqbit">rqbit</a>
+</sub>
+</div>
