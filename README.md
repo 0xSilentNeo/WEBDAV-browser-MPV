@@ -13,7 +13,7 @@ Built for Real-Debrid, works with any WebDAV server.
 ![lua](https://img.shields.io/badge/Lua-script-2c2d72?style=flat-square&logo=lua&logoColor=white)
 ![tmdb](https://img.shields.io/badge/artwork-TMDB-01b4e4?style=flat-square&logo=themoviedatabase&logoColor=white)
 
-[Install](#install) · [Features](#features) · [Keys](#keys) · [Settings](#settings) · [Changelog](CHANGELOG.md)
+[Install](#Install) · [Features](#Features) · [Keys](#Keys) · [Settings](#Settings) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -40,7 +40,7 @@ Pick one, or install both side by side. They share one config file and one watch
 
 <br/>
 
-##Install
+## Install
 
 1. Copy the `.lua` file(s) into `<mpv config>/scripts/` (on Windows, `%APPDATA%\mpv\scripts\`).
 2. Copy `webdav-browser.conf` into `<mpv config>/script-opts/` and fill in your login:
@@ -74,7 +74,7 @@ Pick one, or install both side by side. They share one config file and one watch
 
 <br/>
 
-##Features
+## Features
 
 ### Everywhere
 - **Clean titles** with `S01E03` and quality chips: 4K, HDR, DV, Atmos, Remux.
